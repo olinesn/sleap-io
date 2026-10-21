@@ -11,4 +11,4 @@ gh pr view {PR_NUMBER} --json number,title,body,url,state,closingIssuesReference
 
 If there is an associated issue (linked in the PR metadata or mentioned in the PR description), then use the `gh` CLI to fetch that too to contextualize the work done in the PR.
 
-Include a summary, example usage (for enhancements), API changes, and other notes for future consideration (including reasoning behind design decisions).
+Follow `.github/pull_request_template.md` and the "PR Descriptions" section of CLAUDE.md: a plain-language summary first, then why, what changes, measurements, what was checked, what wasn't, limits, design decisions, API changes and docs, with function names, paths and example usage in the folded "Details for reviewers" block.
