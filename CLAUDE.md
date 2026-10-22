@@ -31,10 +31,14 @@ sleap-io is a standalone utility library for working with animal pose tracking d
 
 ### PR Descriptions
 
-When updating PR descriptions (from .claude/commands/pr-description.md):
+When writing or updating PR descriptions (from .claude/commands/pr-description.md), follow `.github/pull_request_template.md`. The bar is olinesn/campy's PR descriptions (e.g. olinesn/campy#94, olinesn/campy#95, olinesn/campy#96).
 1. Fetch current PR metadata and linked issues using `gh` CLI
-2. Include: Summary, Key Changes, Example Usage, API Changes, Testing, and Design Decisions
-3. Document reasoning behind implementation choices for future reference
+2. Title and opening section in plain words a non-expert can follow. Function names, flags and paths go only in the folded "Details for reviewers" block or the commit body.
+3. Include: Summary, Key Changes, Example Usage, API Changes, Testing, and Design Decisions (the template maps each to a section; example code goes in the folded block)
+4. Every number has a unit and the conditions it was measured under, and comes from a run, a file or the commit, never an estimate. Use before/after tables where something was measured.
+5. Say what was not tested or verified, the known limits, and what changed in `docs/` (or why nothing needed to)
+6. Document reasoning behind implementation choices for future reference
+7. End with "🤖 Generated with [Claude Code](https://claude.com/claude-code)" when Claude wrote it
 
 ## Testing Rules
 
