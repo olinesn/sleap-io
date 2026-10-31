@@ -2135,3 +2135,18 @@ class TestVideoTransforms:
         # Reload and check
         reloaded = sio.load_slp(str(output_path))
         assert len(reloaded.videos) == len(labels.videos)
+
+
+def test_transform_labels_unknown_dimensions_hides_url_credentials(tmp_path):
+    """The can't-determine-dimensions error names a URL without its credentials."""
+    from sleap_io import Labels, Video
+    from sleap_io.transform.video import transform_labels
+
+    video = Video(filename="https://host/v.mp4?token=SECRET", open_backend=False)
+    with pytest.raises(ValueError, match="Cannot determine dimensions") as ei:
+        transform_labels(
+            labels=Labels(videos=[video]),
+            transforms=Transform(scale=(0.5, 0.5)),
+            output_path=tmp_path / "output.slp",
+        )
+    assert "SECRET" not in str(ei.value)

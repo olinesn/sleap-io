@@ -637,6 +637,19 @@ def test_match_video_definitive_over_basename():
     assert labels.match_video("/dir2/vid.mp4") is v2
 
 
+def test_match_video_ambiguous_hides_url_credentials():
+    """The ambiguous-match error names URLs without their credentials."""
+    query = "https://c.test/vid.mp4?token=SECRET"
+    v1 = Video(filename="https://a.test/vid.mp4?token=SECRET", open_backend=False)
+    v2 = Video(filename="https://b.test/vid.mp4?token=SECRET", open_backend=False)
+    labels = Labels(videos=[v1, v2])
+
+    with pytest.raises(ValueError, match="Ambiguous video match") as ei:
+        labels.match_video(query)
+    assert "SECRET" not in str(ei.value)
+    assert "https://a.test/vid.mp4" in str(ei.value)
+
+
 def test_match_video_ambiguous_raises():
     """match_video raises when multiple videos match by basename."""
     v1 = Video(filename="/dir1/vid.mp4", open_backend=False)

@@ -402,6 +402,7 @@ def transform_labels(
         with transformed frame images. The `video_output_dir` and video encoding
         parameters are ignored for embedded videos.
     """
+    from sleap_io.io._remote import _display_filename
     from sleap_io.model.video import Video
 
     output_path = Path(output_path)
@@ -457,12 +458,12 @@ def transform_labels(
                 except Exception:
                     raise ValueError(
                         f"Cannot determine dimensions for video {video_idx}: "
-                        f"{video.filename}"
+                        f"{_display_filename(video.filename)}"
                     )
             else:
                 raise ValueError(
                     f"Cannot determine dimensions for video {video_idx}: "
-                    f"{video.filename}"
+                    f"{_display_filename(video.filename)}"
                 )
 
         # Handle embedded vs regular videos differently

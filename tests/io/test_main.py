@@ -1308,6 +1308,20 @@ def test_load_file_gdrive_url_sniff_false_raises(slp_minimal):
         load_file("https://drive.google.com/file/d/FILEID/view", sniff=False)
 
 
+def test_load_file_gdrive_url_sniff_false_hides_api_key():
+    """The Drive `sniff=False` error shows no API key from the URL."""
+    with pytest.raises(ValueError, match="Cannot infer format") as ei:
+        load_file("https://drive.google.com/file/d/FILEID/view?key=SECRET", sniff=False)
+    assert "SECRET" not in str(ei.value)
+
+
+def test_save_file_unknown_format_hides_url_credentials():
+    """The unknown-format error of a save names a URL without its credentials."""
+    with pytest.raises(ValueError, match="Unknown format") as ei:
+        save_file(Labels(), "https://host/out.bin?token=SECRET")
+    assert "SECRET" not in str(ei.value)
+
+
 def test_load_slp_gdrive_folder_url_raises(slp_minimal):
     """A Drive folder share link raises a clear ValueError."""
     with pytest.raises(ValueError, match="folder URLs are not supported"):
