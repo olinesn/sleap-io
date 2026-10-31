@@ -434,6 +434,56 @@ def test_redacted_cause_summary_redacts_embedded_url():
     assert summary.startswith("FileNotFoundError:")
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        # aiohttp's message for a signed URL whose key holds an apostrophe: ``%27``
+        # comes back as ``'``, and repr() then quotes the URL with ``"``.
+        '403, url="https://h/mouse\'s%20data/x.slp?token=TOPSECRET"',
+        # fsspec's message quotes the URL as it was given.
+        "https://h/mouse's data/x.slp?X-Amz-Signature=TOPSECRET",
+        "https://h/run 1/x.slp?Signature=TOPSECRET",
+        'https://h/a"b<c>/x.slp?key=TOPSECRET',
+        "https://h/x.slp?note=it's&api_key=TOPSECRET",
+        "https://h/x.slp?note=a b&sig=TOPSECRET",
+    ],
+)
+def test_redacted_cause_summary_url_cut_short(message):
+    """A quote or space ends the URL pattern, but what follows is still masked."""
+    assert "TOPSECRET" not in _redacted_cause_summary(ValueError(message))
+
+
+@pytest.mark.parametrize("name", sorted(_SENSITIVE_QUERY_PARAMS))
+def test_redacted_cause_summary_url_cut_short_every_listed_name(name):
+    """Masking by name covers each listed name, however it is capitalized."""
+    for spelled in (name, name.upper(), name.title()):
+        e = ValueError(f"https://h/it's.slp?{spelled}=TOPSECRET&keep=ok")
+        summary = _redacted_cause_summary(e)
+        assert "TOPSECRET" not in summary
+        assert f"?{spelled}=***&keep=ok" in summary
+
+
+def test_redacted_cause_summary_keeps_text_after_a_masked_value():
+    """Masking stops at the value: closing punctuation and later words stay."""
+    for after in ("'), then retry.", "), then retry.", ", then retry.", "."):
+        e = ValueError(f"see 'https://h/it's.slp?token=TOPSECRET{after}")
+        summary = _redacted_cause_summary(e)
+        assert summary == f"ValueError: see 'https://h/it's.slp?token=***{after}"
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "invalid key=abc in row 3",
+        "https://h/it's.slp?keyframe=3&monkey=1&signature_version=s3v4",
+        "unexpected token=abc",
+    ],
+)
+def test_redacted_cause_summary_keeps_what_only_looks_like_a_listed_param(message):
+    """Only a whole listed name right after ``?``, ``&`` or ``#`` counts."""
+    assert _redacted_cause_summary(ValueError(message)) == f"ValueError: {message}"
+
+
 def test_redacted_cause_summary_empty_message():
     """An exception with no message degrades to just its type name."""
     assert _redacted_cause_summary(ValueError()) == "ValueError"
@@ -1067,6 +1117,50 @@ def test_redirect_to_signed_url_shows_no_credential(httpserver, tmp_path):
     assert "X-Amz-Expires=3600" in shown
     assert "AKIAEXAMPLE" not in shown
     assert "TOPSECRET" not in shown
+
+
+def test_refused_signed_url_with_apostrophe_in_key_shows_no_credential(
+    httpserver, tmp_path
+):
+    """An apostrophe in a real signed URL's key can't expose its credentials.
+
+    boto3 writes the key ``mouse's data`` as ``mouse%27s%20data``, and aiohttp's
+    message turns the ``%27`` back into a quote, right in the middle of the URL.
+    """
+    httpserver.expect_request("/mouse's data/labels.slp").respond_with_data(
+        "denied", status=403
+    )
+    query = (
+        "AWSAccessKeyId=AKIAEXAMPLE&Signature=Jrotie1L6y7%2BWzLpFmnOPJxBX0B%3D"
+        "&Expires=1793442129"
+    )
+    url = httpserver.url_for("/mouse%27s%20data/labels.slp") + f"?{query}"
+
+    with pytest.raises(RemoteIOError) as ei:
+        download(url, tmp_path / "labels.slp", retries=0, progress=False)
+
+    shown = _everything_shown(ei.value)
+    assert "mouse's%20data" in shown
+    assert "Expires=1793442129" in shown
+    assert "AKIAEXAMPLE" not in shown
+    assert "Jrotie1L6y7" not in shown
+    assert "WzLpFmnOPJxBX0B" not in shown
+
+
+def test_refused_url_typed_with_quote_and_space_shows_no_credential(httpserver):
+    """A quote or space typed into a URL can't expose its credentials either."""
+    httpserver.expect_request("/mouse's data/labels.slp").respond_with_data(
+        "denied", status=403
+    )
+    url = httpserver.url_for("/mouse's data/labels.slp") + "?token=TOPSECRET&key=KEY"
+
+    with pytest.raises(RemoteIOError) as ei:
+        open_url(url, retries=0)
+
+    shown = _everything_shown(ei.value)
+    assert "mouse's data" in shown
+    assert "TOPSECRET" not in shown
+    assert "=KEY" not in shown
 
 
 # ---------------------------------------------------------------------------

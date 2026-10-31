@@ -133,6 +133,18 @@ _URL_IN_TEXT_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+#: Pattern matching a sensitive query parameter and its value anywhere in text, URL
+#: or no URL: a space or a quote ends what :data:`_URL_IN_TEXT_PATTERN` can see of a
+#: URL, and a name cut from one (``y.slp?token=...``) no longer looks like one. The
+#: ``#`` is for the same parameter in a fragment. Punctuation at the end belongs to
+#: the sentence, not the value.
+_SENSITIVE_PARAM_PATTERN = re.compile(
+    r"([?&#](?:"
+    + "|".join(re.escape(name) for name in sorted(_SENSITIVE_QUERY_PARAMS))
+    + r")=)[^\s\"'<>&#]*[^\s\"'<>&#.,;:!?)]",
+    re.IGNORECASE,
+)
+
 
 # ---------------------------------------------------------------------------
 # Errors
@@ -820,7 +832,9 @@ def _redacted_cause_summary(e: BaseException) -> str:
     userinfo password or a ``?token=`` query parameter) in their string form.
     This returns ``"<TypeName>: <redacted message>"`` so the summary can be
     surfaced to users for debugging without leaking credentials. Every
-    URL-looking substring in the message is run through :func:`_redact_url`.
+    URL-looking substring in the message is run through :func:`_redact_url`, after
+    masking listed parameters by name (:data:`_SENSITIVE_PARAM_PATTERN`) for the
+    URLs a quote or space cuts short.
 
     Args:
         e: The underlying exception.
@@ -834,7 +848,10 @@ def _redacted_cause_summary(e: BaseException) -> str:
         # Some exceptions (e.g. an aiohttp.ClientResponseError without a
         # request_info) raise from their own __str__; fall back to the type name.
         return type(e).__name__
-    redacted = _URL_IN_TEXT_PATTERN.sub(lambda m: _redact_url(m.group(0)), raw)
+    # By name first: aiohttp's message turns ``%27`` back into ``'``, which cuts even
+    # a real signed URL short of its query.
+    redacted = _SENSITIVE_PARAM_PATTERN.sub(r"\1***", raw)
+    redacted = _URL_IN_TEXT_PATTERN.sub(lambda m: _redact_url(m.group(0)), redacted)
     redacted = redacted.replace("\n", " ").replace("\r", " ").strip()
     if redacted:
         return f"{type(e).__name__}: {redacted}"
