@@ -172,6 +172,22 @@ def test_is_url_pathlike():
     assert _is_url(Path("labels.slp")) is False
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:SECRET@[bad/labels.slp?token=SECRET",
+        "https://user:SECRET\u2100@host/labels.slp",
+    ],
+    ids=["brackets", "refused-character"],
+)
+def test_is_url_malformed_hides_credentials(url):
+    """The refusal from urlparse can quote the netloc, so it's replaced."""
+    with pytest.raises(ValueError, match="Malformed URL") as ei:
+        _is_url(url)
+    shown = "".join(traceback.format_exception(ei.value))
+    assert "SECRET" not in shown
+
+
 def test_is_url_non_string_non_pathlike():
     """Non str/PathLike inputs return False rather than raising."""
     assert _is_url(123) is False  # type: ignore[arg-type]

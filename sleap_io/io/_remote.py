@@ -224,13 +224,20 @@ def _is_url(filename: str | os.PathLike) -> bool:
 
     Returns:
         True if the scheme is a recognized remote scheme, else False.
+
+    Raises:
+        ValueError: If ``filename`` is a URL too malformed to parse.
     """
     if not isinstance(filename, (str, os.PathLike)):
         return False
     s = os.fspath(filename) if isinstance(filename, os.PathLike) else filename
     if not s:
         return False
-    scheme = urllib.parse.urlparse(s).scheme.lower()
+    try:
+        scheme = urllib.parse.urlparse(s).scheme.lower()
+    except ValueError:
+        # urlparse's own message can quote the netloc, password included.
+        raise ValueError(f"Malformed URL: {_redact_url(s)}") from None
     return scheme in _URL_SCHEMES
 
 
