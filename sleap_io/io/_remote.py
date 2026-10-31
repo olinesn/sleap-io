@@ -266,15 +266,19 @@ def _redact_url(url: str) -> str:
         url: The URL to redact.
 
     Returns:
-        The redacted URL. If parsing fails, returns the input unchanged.
+        The redacted URL. A URL that can't be parsed has its userinfo and listed
+        parameters masked and is otherwise returned as it was.
     """
     try:
         parsed = urllib.parse.urlparse(url)
-    except (ValueError, TypeError):  # pragma: no cover - urlparse is permissive
-        return url
+    except ValueError:
+        # urlparse refuses some malformed URLs, such as ``https://[x``.
+        masked = re.sub(r"(://)[^/?#]*@", r"\1***:***@", url)
+        return _SENSITIVE_PARAM_PATTERN.sub(r"\1***", masked)
     netloc = parsed.netloc
     if "@" in netloc:
-        netloc = "***:***@" + netloc.split("@", 1)[1]
+        # The last ``@`` ends the userinfo: a password can hold one.
+        netloc = "***:***@" + netloc.rsplit("@", 1)[1]
     if parsed.query:
         params = urllib.parse.parse_qsl(parsed.query, keep_blank_values=True)
         redacted_params = []

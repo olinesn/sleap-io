@@ -351,6 +351,18 @@ def test_redact_url_ordinary_fragment_unchanged():
     assert _redact_url(url) == url
 
 
+def test_redact_url_password_holding_at_sign():
+    """The whole password is hidden when it holds an ``@``: the last one ends it."""
+    out = _redact_url("https://user:pa@ss@host.example/labels.slp?a=1")
+    assert out == "https://***:***@host.example/labels.slp?a=1"
+
+
+def test_redact_url_unparsable_still_masked():
+    """A URL urlparse refuses still has its userinfo and listed params masked."""
+    out = _redact_url("https://user:s3cr3t@[bad/labels.slp?token=SECRET&a=1")
+    assert out == "https://***:***@[bad/labels.slp?token=***&a=1"
+
+
 # ---------------------------------------------------------------------------
 # _identify_magic
 # ---------------------------------------------------------------------------
