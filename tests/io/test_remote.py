@@ -1110,6 +1110,28 @@ def test_refused_signed_url_shows_no_credential(
             assert credential not in shown
 
 
+@pytest.mark.parametrize("query,credentials", _SIGNED_QUERIES)
+def test_signed_url_requests_carry_every_credential(
+    httpserver, tmp_path, query, credentials
+):
+    """Masking is only for messages: each request still carries the URL's query."""
+    serve = _make_range_handler(_HDF5_BODY)
+    seen = []
+
+    def _handler(request):
+        seen.append(urllib.parse.parse_qsl(request.query_string.decode()))
+        return serve(request)
+
+    httpserver.expect_request("/session1/labels.slp").respond_with_handler(_handler)
+    url = httpserver.url_for("/session1/labels.slp") + f"?{query}"
+
+    assert download(url, tmp_path / "labels.slp", retries=0, progress=False).exists()
+    assert open_url(url, retries=0).read(8) == _HDF5_BODY[:8]
+
+    assert seen
+    assert all(params == urllib.parse.parse_qsl(query) for params in seen)
+
+
 def test_redirect_to_signed_url_shows_no_credential(httpserver, tmp_path):
     """A failure after a redirect names the signed target with credentials hidden.
 
