@@ -1,5 +1,6 @@
 """Tests for functions in the sleap_io.io.main file."""
 
+import gc
 import inspect
 import io
 import json
@@ -10,6 +11,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import pytest
+from h5py._objects import ObjectID
 
 from sleap_io import Labels, LabelsSet, RemoteIOError, Video, clear_remote_cache
 from sleap_io.io._remote import _require_package, open_url
@@ -715,6 +717,50 @@ def test_load_slp_url_later_read_failure_shows_no_credential(
     assert "TOPSECRET" not in "".join(
         traceback.format_exception(type(e), e, e.__traceback__)
     )
+
+
+def _h5py_objects_left_for_the_garbage_collector(load) -> list:
+    """Run a load that fails, and return the h5py objects only a collection would free.
+
+    Args:
+        load: A callable that raises `RemoteIOError`.
+
+    Returns:
+        The h5py objects the failure left in reference cycles.
+    """
+    gc.collect()
+    gc.disable()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        with pytest.raises(RemoteIOError):
+            load()
+        gc.collect()
+        return [obj for obj in gc.garbage if isinstance(obj, ObjectID)]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+
+
+@pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+def test_load_slp_url_later_read_failure_leaves_nothing_to_deadlock_on(
+    httpserver, centered_pair, lazy
+):
+    """A failed load leaves no h5py objects for the garbage collector.
+
+    If it did, the collector could free them on fsspec's thread during the next load,
+    wanting h5py's global lock while the read holding it waits on that thread. Both
+    wait forever, so a retry after a failure would hang.
+    """
+    _serve_slp_until(
+        httpserver, "/labels.slp", Path(centered_pair).read_bytes(), limit=1 << 20
+    )
+    url = httpserver.url_for("/labels.slp")
+
+    def load():
+        load_slp(url, retries=0, open_videos=False, lazy=lazy)
+
+    assert _h5py_objects_left_for_the_garbage_collector(load) == []
 
 
 def test_h5py_name_of_a_remote_file_shows_no_credential(httpserver, slp_minimal):

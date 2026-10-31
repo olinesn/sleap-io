@@ -961,11 +961,25 @@ def _raise_remote(e: BaseException, *, url: str, fallback: str | None = None) ->
             cause_summary=summary,
         )
 
+    # The raw exception is finished with, and must not keep this call stack alive (see
+    # `_raise_if_remote_failure`). fsspec's `sync` holds it in a local, which puts its
+    # traceback in a cycle, and frames reach their callers through `f_back`.
+    seen: set[int] = set()
+    cur: BaseException | None = e
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        cur.__traceback__ = None
+        cur = cur.__cause__ or cur.__context__
+
     # Break the credential-bearing chain: `raise ... from None` clears
     # `__cause__` and sets `__suppress_context__`, so `traceback.format_exception`
     # never prints the raw aiohttp/fsspec exception (whose string embeds the raw
     # URL). The redacted `cause_summary` carries the useful debugging info.
-    raise err from None
+    try:
+        raise err from None
+    finally:
+        # This frame goes in `err`'s traceback, so holding `err` here would be a cycle.
+        del err
 
 
 def _quotes_url(e: BaseException) -> bool:
@@ -1000,6 +1014,11 @@ def _raise_if_remote_failure(
     That means a network failure, or anything that quotes a URL, since its message or
     chain would show the credentials. Anything else (``IndexError`` for a frame out of
     range, say) is the caller's to raise again as it was.
+
+    The failure must not stay in a reference cycle. The frames in its traceback can
+    hold h5py objects, and if the garbage collector frees those on fsspec's thread
+    while a later read waits on that thread holding h5py's global lock, both wait
+    forever. So a load retried after a failure would hang.
 
     Args:
         e: The caught exception.
