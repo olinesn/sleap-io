@@ -258,8 +258,9 @@ def _redact_url(url: str) -> str:
     ``https://user:pass@host/path?token=xyz`` becomes
     ``https://***:***@host/path?token=%2A%2A%2A``. Userinfo is replaced and the
     query parameters in :data:`_SENSITIVE_QUERY_PARAMS` (tokens, signed URLs'
-    signatures and access keys, API keys) have their values redacted. The result
-    is for display only: the original URL is what gets requested.
+    signatures and access keys, API keys) have their values redacted, in the
+    fragment too. The result is for display only: the original URL is what gets
+    requested.
 
     Args:
         url: The URL to redact.
@@ -285,7 +286,11 @@ def _redact_url(url: str) -> str:
         new_query = urllib.parse.urlencode(redacted_params)
     else:
         new_query = ""
-    return urllib.parse.urlunparse(parsed._replace(netloc=netloc, query=new_query))
+    # An unencoded ``#`` in a path pushes the query here, so mask the fragment too.
+    fragment = _SENSITIVE_PARAM_PATTERN.sub(r"\1***", f"#{parsed.fragment}")[1:]
+    return urllib.parse.urlunparse(
+        parsed._replace(netloc=netloc, query=new_query, fragment=fragment)
+    )
 
 
 # ---------------------------------------------------------------------------

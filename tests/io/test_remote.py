@@ -333,6 +333,24 @@ def test_redact_url_ordinary_key_param_hides_only_its_value():
     assert out == "https://proxy.example/get?key=%2A%2A%2A&other=1"
 
 
+def test_redact_url_hides_listed_params_in_fragment():
+    """A fragment is masked by the same names, and the rest of it stays readable."""
+    out = _redact_url("https://host/x.slp#X-Amz-Signature=SECRET&key=SECRET&note=ok")
+    assert out == "https://host/x.slp#X-Amz-Signature=***&key=***&note=ok"
+
+
+def test_redact_url_unencoded_hash_in_path():
+    """An unencoded ``#`` in a path can't expose the query that ends up after it."""
+    out = _redact_url("https://host/run#2/labels.slp?token=SECRET&a=1")
+    assert out == "https://host/run#2/labels.slp?token=***&a=1"
+
+
+def test_redact_url_ordinary_fragment_unchanged():
+    """A fragment with no listed name is left alone."""
+    url = "https://host/x.slp?a=1#frame=3&monkey=2"
+    assert _redact_url(url) == url
+
+
 # ---------------------------------------------------------------------------
 # _identify_magic
 # ---------------------------------------------------------------------------
