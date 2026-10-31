@@ -16,6 +16,7 @@ hot path.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import importlib
 import io
 import os
@@ -26,6 +27,7 @@ import tempfile
 import time
 import urllib.parse
 import warnings
+from collections.abc import Iterator
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -295,6 +297,45 @@ def _redact_url(url: str) -> str:
     return urllib.parse.urlunparse(
         parsed._replace(netloc=netloc, query=new_query, fragment=fragment)
     )
+
+
+def _redact_text(text: str) -> str:
+    """Mask the credentials in free text, such as an exception's message.
+
+    Args:
+        text: Text that may quote URLs.
+
+    Returns:
+        The text with listed parameters masked by name and every URL-looking
+        substring run through :func:`_redact_url`.
+    """
+    # By name first: aiohttp's message turns ``%27`` back into ``'``, which cuts even
+    # a real signed URL short of its query.
+    redacted = _SENSITIVE_PARAM_PATTERN.sub(r"\1***", text)
+    return _URL_IN_TEXT_PATTERN.sub(lambda m: _redact_url(m.group(0)), redacted)
+
+
+def _display_filename(filename: Any) -> Any:
+    """Return a filename fit to show in a message, a ``repr`` or command output.
+
+    Args:
+        filename: A local path or a URL, or a list of them (an image sequence).
+
+    Returns:
+        A URL redacted by :func:`_redact_url`, and a list item by item. Anything else
+        comes back as it was, so what's shown for local files doesn't change. Use it
+        for display only: a redacted URL can't be opened.
+    """
+    if isinstance(filename, (list, tuple)):
+        return [_display_filename(name) for name in filename]
+    name = os.fspath(filename) if isinstance(filename, os.PathLike) else filename
+    if not isinstance(name, str):
+        return filename
+    try:
+        return _redact_url(name) if _is_url(name) else filename
+    except ValueError:
+        # urlparse refuses some malformed URLs, such as ``https://[x``.
+        return _redact_text(name)
 
 
 # ---------------------------------------------------------------------------
@@ -769,7 +810,9 @@ def open_url(
             with fs.open(url, mode="rb") as src:
                 return io.BytesIO(src.read())
 
-    return _open_with_retries(_open, url=url, retries=retries)
+    file = _open_with_retries(_open, url=url, retries=retries)
+    # The other modes have the whole file by now, so nothing else can fail remotely.
+    return _RemoteFile(file, url=url) if stream_mode == "blockcache" else file
 
 
 def open_remote_h5(url: str, *, headers: dict[str, str] | None = None):
@@ -857,17 +900,13 @@ def _redacted_cause_summary(e: BaseException) -> str:
         # Some exceptions (e.g. an aiohttp.ClientResponseError without a
         # request_info) raise from their own __str__; fall back to the type name.
         return type(e).__name__
-    # By name first: aiohttp's message turns ``%27`` back into ``'``, which cuts even
-    # a real signed URL short of its query.
-    redacted = _SENSITIVE_PARAM_PATTERN.sub(r"\1***", raw)
-    redacted = _URL_IN_TEXT_PATTERN.sub(lambda m: _redact_url(m.group(0)), redacted)
-    redacted = redacted.replace("\n", " ").replace("\r", " ").strip()
+    redacted = _redact_text(raw).replace("\n", " ").replace("\r", " ").strip()
     if redacted:
         return f"{type(e).__name__}: {redacted}"
     return type(e).__name__
 
 
-def _raise_remote(e: BaseException, *, url: str) -> None:
+def _raise_remote(e: BaseException, *, url: str, fallback: str | None = None) -> None:
     """Convert an aiohttp/fsspec exception into a :class:`RemoteIOError`.
 
     The original exception is deliberately *not* chained (``from None``): its
@@ -879,6 +918,8 @@ def _raise_remote(e: BaseException, *, url: str) -> None:
     Args:
         e: The caught exception.
         url: The URL involved (redacted before display).
+        fallback: What to call the failure if it isn't one of the network errors
+            mapped here. Defaults to ``unexpected error`` and the exception's type.
 
     Raises:
         RemoteIOError: Always (this function never returns normally).
@@ -908,7 +949,9 @@ def _raise_remote(e: BaseException, *, url: str) -> None:
         err = RemoteIOError("timeout", url=url, cause_summary=summary)
     else:
         err = RemoteIOError(
-            f"unexpected error: {type(e).__name__}", url=url, cause_summary=summary
+            fallback or f"unexpected error: {type(e).__name__}",
+            url=url,
+            cause_summary=summary,
         )
 
     # Break the credential-bearing chain: `raise ... from None` clears
@@ -916,6 +959,139 @@ def _raise_remote(e: BaseException, *, url: str) -> None:
     # never prints the raw aiohttp/fsspec exception (whose string embeds the raw
     # URL). The redacted `cause_summary` carries the useful debugging info.
     raise err from None
+
+
+def _quotes_url(e: BaseException) -> bool:
+    """Return True if an exception, or one in its chain, quotes a URL or credential.
+
+    Args:
+        e: The caught exception.
+
+    Returns:
+        True if any message in ``e``'s cause/context chain holds a URL or a listed
+        query parameter.
+    """
+    seen: set[int] = set()
+    cur: BaseException | None = e
+    while cur is not None and id(cur) not in seen:
+        seen.add(id(cur))
+        try:
+            text = str(cur)
+        except Exception:  # See `_redacted_cause_summary`.
+            text = ""
+        if _URL_IN_TEXT_PATTERN.search(text) or _SENSITIVE_PARAM_PATTERN.search(text):
+            return True
+        cur = cur.__cause__ or cur.__context__
+    return False
+
+
+def _raise_if_remote_failure(
+    e: Exception, *, url: str, fallback: str | None = None
+) -> None:
+    """Convert ``e`` to a :class:`RemoteIOError` if it's a failure on a remote file.
+
+    That means a network failure, or anything that quotes a URL, since its message or
+    chain would show the credentials. Anything else (``IndexError`` for a frame out of
+    range, say) is the caller's to raise again as it was.
+
+    Args:
+        e: The caught exception.
+        url: The URL involved (redacted before display).
+        fallback: See :func:`_raise_remote`.
+
+    Raises:
+        RemoteIOError: If ``e`` is a failure on the remote file.
+    """
+    import aiohttp
+
+    network_errors = (OSError, aiohttp.ClientError, asyncio.TimeoutError)
+    if isinstance(e, network_errors) or _quotes_url(e):
+        _raise_remote(e, url=url, fallback=fallback)
+
+
+@contextlib.contextmanager
+def _remote_errors(filename: Any, *, fallback: str | None = None) -> Iterator[None]:
+    """Raise failures reading ``filename`` as :class:`RemoteIOError` if it's a URL.
+
+    For a decoder handed the URL directly: imageio and PyAV quote it in their errors.
+    A local file's errors pass through as they are.
+
+    Args:
+        filename: What's being read: a local path or a URL, or a list of them.
+        fallback: See :func:`_raise_remote`.
+
+    Yields:
+        Nothing.
+
+    Raises:
+        RemoteIOError: If the block fails on a remote file.
+    """
+    try:
+        yield
+    except Exception as e:
+        url = filename[0] if isinstance(filename, list) and filename else filename
+        if isinstance(url, str) and _is_url(url):
+            _raise_if_remote_failure(e, url=url, fallback=fallback)
+        raise
+
+
+class _RemoteFile:
+    """A remote file being streamed, whose failures can't show its URL.
+
+    ``blockcache`` mode fetches a block only when it's read, long after the open that
+    :func:`_open_with_retries` guards, so a link can expire or a server can fail at
+    any point in a load. The raw aiohttp/fsspec error quotes the raw URL, so here it
+    comes out as a :class:`RemoteIOError`, like a failed open. h5py also takes a file
+    object's ``repr`` as the file's name, and fsspec's holds the raw URL.
+
+    Everything else is the wrapped file's.
+
+    Attributes:
+        _file: The wrapped file object.
+        _url: The raw URL it came from, for the errors. Never shown as it is.
+    """
+
+    def __init__(self, file: Any, *, url: str) -> None:
+        """Wrap an open remote file.
+
+        Args:
+            file: The file object fsspec opened.
+            url: The URL it came from.
+        """
+        self._file = file
+        self._url = url
+
+    def __getattr__(self, name: str) -> Any:
+        """Return an attribute of the wrapped file, with its failures converted."""
+        # Not `self._file`: an instance being copied has none yet, and that lookup
+        # would land back here.
+        attr = getattr(object.__getattribute__(self, "_file"), name)
+        if not callable(attr):
+            return attr
+
+        def guarded(*args: Any, **kwargs: Any) -> Any:
+            try:
+                return attr(*args, **kwargs)
+            except Exception as e:
+                _raise_if_remote_failure(e, url=self._url)
+                raise
+
+        # h5py asks for `seek` and `readinto` on every read: skip this next time.
+        self.__dict__[name] = guarded
+        return guarded
+
+    def __repr__(self) -> str:
+        """Name the file without its credentials."""
+        return f"<remote file {_redact_url(self._url)}>"
+
+    def __enter__(self) -> "_RemoteFile":
+        """Enter the wrapped file's context, handing back this wrapper."""
+        self._file.__enter__()
+        return self
+
+    def __exit__(self, *exc_info: Any) -> Any:
+        """Leave the wrapped file's context."""
+        return self._file.__exit__(*exc_info)
 
 
 # ---------------------------------------------------------------------------
