@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import sys
 import urllib.parse
 from io import BytesIO
@@ -397,6 +398,50 @@ def _fps_from_av_container(filename: str) -> float | None:
         container.close()
 
 
+def _filename_repr(filename: str | Path | list[str] | list[Path] | None) -> str:
+    """Format a backend's filename for its `repr`, without a URL's credentials."""
+    return repr(_remote._display_filename(filename))
+
+
+def _open_capture(filename: str) -> "cv2.VideoCapture":
+    """Open a video with OpenCV.
+
+    Args:
+        filename: A local path or a URL.
+
+    Returns:
+        The capture. For a URL it's FFmpeg's, the backend that can read one: left to
+        choose, OpenCV tries AVFoundation first on macOS, which prints the raw URL to
+        stderr from C++ as it gives up, past anything Python can mask.
+    """
+    if _remote._is_url(filename):
+        return cv2.VideoCapture(filename, cv2.CAP_FFMPEG)
+    return cv2.VideoCapture(filename)
+
+
+def _remote_read(method):
+    """Raise a backend read's failures on a URL as `RemoteIOError`.
+
+    imageio and PyAV are handed the URL itself and quote it in their errors, and a
+    `RemoteIOError` can't show its credentials. Errors with nothing to hide, such as
+    an `IndexError` for a frame out of range, come through as they are, and so does
+    everything for a local file.
+
+    Args:
+        method: A `VideoBackend` method that reads from `self.filename`.
+
+    Returns:
+        The method with its failures converted.
+    """
+
+    @functools.wraps(method)
+    def guarded(self, *args, **kwargs):
+        with _remote._remote_errors(self.filename, fallback="could not read the video"):
+            return method(self, *args, **kwargs)
+
+    return guarded
+
+
 @attrs.define
 class VideoBackend:
     """Base class for video backends.
@@ -416,7 +461,7 @@ class VideoBackend:
             be set explicitly or will be None.
     """
 
-    filename: str | Path | list[str] | list[Path]
+    filename: str | Path | list[str] | list[Path] = attrs.field(repr=_filename_repr)
     grayscale: bool | None = None
     keep_open: bool = True
     _cached_shape: tuple[int, int, int, int] | None = None
@@ -697,7 +742,8 @@ class VideoBackend:
                 **_get_valid_kwargs(HDF5Video, kwargs),
             )
         else:
-            raise ValueError(f"Unknown video file type: {filename}")
+            shown = _remote._display_filename(filename)
+            raise ValueError(f"Unknown video file type: {shown}")
 
     def _read_frame(self, frame_idx: int) -> np.ndarray:
         """Read a single frame from the video. Must be implemented in subclasses."""
@@ -707,6 +753,7 @@ class VideoBackend:
         """Read a list of frames from the video."""
         return np.stack([self.get_frame(i) for i in frame_inds], axis=0)
 
+    @_remote_read
     def read_test_frame(self) -> np.ndarray:
         """Read a single frame from the video to test for grayscale.
 
@@ -789,6 +836,7 @@ class VideoBackend:
         """
         return frame_idx < len(self)
 
+    @_remote_read
     def get_frame(self, frame_idx: int) -> np.ndarray:
         """Read a single frame from the video.
 
@@ -821,6 +869,7 @@ class VideoBackend:
 
         return img
 
+    @_remote_read
     def get_frames(self, frame_inds: list[int]) -> np.ndarray:
         """Read a list of frames from the video.
 
@@ -988,12 +1037,13 @@ class MediaVideo(VideoBackend):
         return {"thread_type": "AUTO"} if self.plugin == "pyav" else {}
 
     @property
+    @_remote_read
     def reader(self) -> object:
         """Return the reader object for the video, caching if necessary."""
         if self.keep_open:
             if self._open_reader is None:
                 if self.plugin == "opencv":
-                    self._open_reader = cv2.VideoCapture(self.filename)
+                    self._open_reader = _open_capture(self.filename)
                 elif self.plugin == "pyav" or self.plugin == "FFMPEG":
                     self._open_reader = iio.imopen(
                         self.filename, "r", plugin=self.plugin
@@ -1001,11 +1051,12 @@ class MediaVideo(VideoBackend):
             return self._open_reader
         else:
             if self.plugin == "opencv":
-                return cv2.VideoCapture(self.filename)
+                return _open_capture(self.filename)
             elif self.plugin == "pyav" or self.plugin == "FFMPEG":
                 return iio.imopen(self.filename, "r", plugin=self.plugin)
 
     @property
+    @_remote_read
     def num_frames(self) -> int:
         """Number of frames in the video."""
         if self.plugin == "opencv":
@@ -1105,10 +1156,10 @@ class MediaVideo(VideoBackend):
         if self.plugin == "opencv":
             if self.keep_open:
                 if self._open_reader is None:
-                    self._open_reader = cv2.VideoCapture(self.filename)
+                    self._open_reader = _open_capture(self.filename)
                 reader = self._open_reader
             else:
-                reader = cv2.VideoCapture(self.filename)
+                reader = _open_capture(self.filename)
 
             if reader.get(cv2.CAP_PROP_POS_FRAMES) != frame_idx:
                 reader.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -1146,10 +1197,10 @@ class MediaVideo(VideoBackend):
         if self.plugin == "opencv":
             if self.keep_open:
                 if self._open_reader is None:
-                    self._open_reader = cv2.VideoCapture(self.filename)
+                    self._open_reader = _open_capture(self.filename)
                 reader = self._open_reader
             else:
-                reader = cv2.VideoCapture(self.filename)
+                reader = _open_capture(self.filename)
 
             reader.set(cv2.CAP_PROP_POS_FRAMES, frame_inds[0])
             imgs = []
@@ -1258,7 +1309,7 @@ class HDF5Video(VideoBackend):
     _stored_channels: int | None = attrs.field(
         init=False, default=None, repr=False, eq=False
     )
-    source_filename: str | None = None
+    source_filename: str | None = attrs.field(default=None, repr=_filename_repr)
     source_inds: np.ndarray | None = None
     image_format: str = "hdf5"
     channel_order: str = "RGB"
@@ -2068,10 +2119,17 @@ class ImageVideo(VideoBackend):
             - opencv: Returns BGR, automatically flipped to RGB
         """
         if self.plugin == "opencv":
-            # OpenCV reads as BGR, flip to RGB
-            img = cv2.imread(self.filename[frame_idx], cv2.IMREAD_UNCHANGED)
+            # OpenCV reads as BGR, flip to RGB. It can't read a URL, and prints the raw
+            # URL to stderr from C++ as it fails, so it doesn't get to try.
+            filename = self.filename[frame_idx]
+            img = (
+                None
+                if _remote._is_url(filename)
+                else cv2.imread(filename, cv2.IMREAD_UNCHANGED)
+            )
             if img is None:
-                raise ValueError(f"Failed to read image: {self.filename[frame_idx]}")
+                shown = _remote._display_filename(filename)
+                raise ValueError(f"Failed to read image: {shown}")
             if img.ndim == 3 and img.shape[-1] == 3:
                 img = img[..., ::-1]  # BGR -> RGB
         else:  # imageio
@@ -2393,7 +2451,7 @@ class CropVideoBackend(VideoBackend):
     """
 
     filename: str | Path | list[str] | list[Path] = attrs.field(
-        init=False, default=None
+        init=False, default=None, repr=_filename_repr
     )
     inner: VideoBackend = attrs.field(kw_only=True)
     crop: tuple[int, int, int, int] = attrs.field(

@@ -10,6 +10,13 @@ from sleap_io.io.seq import _HEADER_SIZE, _MAGIC, SeqHeader, SeqIndex, SeqVideo
 from sleap_io.io.video_reading import VideoBackend
 
 
+def test_seq_video_missing_url_hides_credentials():
+    """The not-found error names a URL without its credentials."""
+    with pytest.raises(FileNotFoundError, match="File not found") as ei:
+        SeqVideo("https://host.invalid/a.seq?token=SECRET")
+    assert "SECRET" not in str(ei.value)
+
+
 def _write_seq_header(
     f,
     width=64,

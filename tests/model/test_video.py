@@ -17,6 +17,36 @@ from sleap_io.model.video import _resolve_crop_rect
 from sleap_io.transform.frame import crop_frame
 
 
+def test_video_repr_hides_url_credentials():
+    """Printing a video masks its URL, which stays whole on the video itself."""
+    url = "https://host/v.mp4?X-Amz-Signature=SECRET&keep=ok"
+    video = Video(filename=url, open_backend=False)
+    for shown in (repr(video), str(video), f"{video}"):
+        assert "SECRET" not in shown
+        assert "keep=ok" in shown
+    assert video.filename == url
+
+
+def test_video_repr_image_sequence_of_urls_hides_credentials():
+    """Each URL of an image sequence is masked."""
+    urls = ["https://host/a.png?token=SECRET", "https://host/b.png?token=SECRET"]
+    assert "SECRET" not in repr(Video(filename=urls, open_backend=False))
+
+
+def test_video_repr_local_path_unchanged():
+    """A local path is shown exactly as it is, whatever it looks like."""
+    video = Video(filename="/data/run?key=1/v.mp4", open_backend=False)
+    assert 'filename="/data/run?key=1/v.mp4"' in repr(video)
+
+
+def test_set_video_plugin_non_media_hides_url_credentials():
+    """Refusing to set a plugin names the URL without its credentials."""
+    video = Video(filename="https://host/labels.slp?token=SECRET", open_backend=False)
+    with pytest.raises(ValueError, match="Cannot set plugin") as ei:
+        video.set_video_plugin("opencv")
+    assert "SECRET" not in str(ei.value)
+
+
 def test_video_class():
     """Test initialization of `Video` object."""
     test_video = Video(filename="123.mp4")
