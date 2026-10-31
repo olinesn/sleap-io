@@ -2150,3 +2150,30 @@ def test_transform_labels_unknown_dimensions_hides_url_credentials(tmp_path):
             output_path=tmp_path / "output.slp",
         )
     assert "SECRET" not in str(ei.value)
+
+
+def test_transform_labels_failed_read_hides_url_credentials(tmp_path, slp_minimal_pkg):
+    """The error for a frame that can't be read names a URL without its credentials."""
+    from unittest.mock import PropertyMock, patch
+
+    import sleap_io as sio
+    from sleap_io.model.video import Video
+    from sleap_io.transform.video import transform_labels
+
+    labels = sio.load_slp(slp_minimal_pkg)
+    labels.videos[0].filename = "https://host/v.pkg.slp?token=SECRET"
+
+    def raise_on_getitem(self, idx):
+        raise RuntimeError("Cannot read frame")
+
+    with (
+        patch.object(Video, "shape", new_callable=PropertyMock, return_value=None),
+        patch.object(Video, "__getitem__", raise_on_getitem),
+    ):
+        with pytest.raises(ValueError, match="Cannot determine dimensions") as ei:
+            transform_labels(
+                labels=labels,
+                transforms=Transform(scale=(0.5, 0.5)),
+                output_path=tmp_path / "output.slp",
+            )
+    assert "SECRET" not in str(ei.value)

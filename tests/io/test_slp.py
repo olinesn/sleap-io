@@ -6839,11 +6839,11 @@ def test_check_format_id_hides_url_credentials(tmp_path):
 
 
 def test_embed_frame_out_of_range_hides_url_credentials(
-    httpserver, tmp_path, centered_pair_low_quality_path
+    httpserver, tmp_path, small_robot_path
 ):
     """The missing-frame error of an embed names a URL without its credentials."""
     httpserver.expect_request("/movie.mp4").respond_with_data(
-        Path(centered_pair_low_quality_path).read_bytes(), content_type="video/mp4"
+        Path(small_robot_path).read_bytes(), content_type="video/mp4"
     )
     url = httpserver.url_for("/movie.mp4") + "?token=SECRET"
     frames = [

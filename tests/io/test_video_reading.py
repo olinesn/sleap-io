@@ -2052,12 +2052,29 @@ def test_remote_video_decode_failure_keep_open_false(httpserver):
     assert "TOPSECRET" not in _everything_shown(exc_info.value)
 
 
+@pytest.mark.parametrize(
+    "read",
+    [lambda backend: backend.get_frame(0), lambda backend: backend.get_frames([0])],
+    ids=["get_frame", "get_frames"],
+)
+def test_remote_video_decode_failure_after_shape_is_known(httpserver, read):
+    """Reading a frame is guarded itself: a known shape skips what would fail first."""
+    httpserver.expect_request("/junk.mp4").respond_with_data(b"\x07" * 4096)
+    url = httpserver.url_for("/junk.mp4") + f"?{_SIGNED_VIDEO_QUERY}"
+    backend = MediaVideo(url, keep_open=False, plugin="pyav")
+    backend._cached_shape = (10, 4, 4, 1)
+
+    with pytest.raises(sio.RemoteIOError) as exc_info:
+        read(backend)
+    assert "TOPSECRET" not in _everything_shown(exc_info.value)
+
+
 def test_remote_video_frame_out_of_range_stays_index_error(
-    httpserver, centered_pair_low_quality_path
+    httpserver, small_robot_path
 ):
     """Asking for a frame that isn't there isn't a network failure."""
     httpserver.expect_request("/movie.mp4").respond_with_data(
-        Path(centered_pair_low_quality_path).read_bytes(), content_type="video/mp4"
+        Path(small_robot_path).read_bytes(), content_type="video/mp4"
     )
     url = httpserver.url_for("/movie.mp4") + "?token=TOPSECRET"
 
@@ -2109,13 +2126,13 @@ def test_opencv_prints_no_url_credentials(capfd, httpserver):
     assert "TOPSECRET" not in captured.out + captured.err
 
 
-def test_opencv_reads_a_remote_video(httpserver, centered_pair_low_quality_path):
+def test_opencv_reads_a_remote_video(httpserver, small_robot_path):
     """Asking for FFmpeg by name still reads a URL, keeping the query in the request."""
     seen = []
 
     def handler(request):
         seen.append(request.query_string.decode())
-        data = Path(centered_pair_low_quality_path).read_bytes()
+        data = Path(small_robot_path).read_bytes()
         rng = request.headers.get("Range")
         if not rng:
             return Response(data, content_type="video/mp4")
@@ -2129,7 +2146,7 @@ def test_opencv_reads_a_remote_video(httpserver, centered_pair_low_quality_path)
     url = httpserver.url_for("/movie.mp4") + "?token=TOPSECRET"
 
     frame = MediaVideo(url, plugin="opencv", grayscale=True)[0]
-    assert frame.shape == (384, 384, 1)
+    assert frame.shape == (320, 560, 1)
     assert seen
     assert all(query == "token=TOPSECRET" for query in seen)
 

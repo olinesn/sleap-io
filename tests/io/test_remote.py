@@ -627,6 +627,22 @@ def test_remote_errors_list_of_urls():
     assert "TOPSECRET" not in _everything_shown(ei.value)
 
 
+@pytest.mark.parametrize(
+    "error,match",
+    [
+        (OSError("Connection reset by peer"), "could not read"),
+        (aiohttp.ClientPayloadError("Payload is not completed"), "truncated body"),
+        (asyncio.TimeoutError(), "timeout"),
+    ],
+    ids=["os-error", "payload-error", "timeout"],
+)
+def test_remote_errors_converts_network_failures_quoting_nothing(error, match):
+    """A network failure on a URL is converted even if its message names no URL."""
+    with pytest.raises(RemoteIOError, match=match):
+        with _remote_errors(_SECRET_URL, fallback="could not read"):
+            raise error
+
+
 # ---------------------------------------------------------------------------
 # _raise_remote mapping
 # ---------------------------------------------------------------------------
