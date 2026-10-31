@@ -32,7 +32,12 @@ from rich.panel import Panel
 from rich.table import Table
 
 from sleap_io.io import main as io_main
-from sleap_io.io._remote import _is_url, _redact_url
+from sleap_io.io._remote import (
+    _display_filename,
+    _is_url,
+    _redact_text,
+    _redact_url,
+)
 from sleap_io.io.video_reading import HDF5Video
 from sleap_io.model.event import PredictedEvent
 from sleap_io.model.instance import Instance, PredictedInstance, Track
@@ -199,6 +204,9 @@ class _RemoteInputPath(str):
     (:meth:`exists`, :meth:`is_dir`, :meth:`is_file`) report ``False`` because a
     URL is not a local file; callers already guard size/stat lookups on these.
 
+    What an f-string shows of it has its credentials masked (see :meth:`__format__`),
+    since that's how the commands report their input. ``str(path)`` stays verbatim.
+
     Attributes:
         name: The final path segment of the URL (e.g. ``file.slp``).
         suffix: The file extension of :attr:`name` (e.g. ``.slp``).
@@ -250,6 +258,10 @@ class _RemoteInputPath(str):
     def resolve(self) -> "_RemoteInputPath":
         """Return self (a URL is already absolute; nothing to resolve)."""
         return self
+
+    def __format__(self, format_spec: str) -> str:
+        """Format for display, with the URL's credentials masked."""
+        return format(_redact_url(str(self)), format_spec)
 
     def exists(self) -> bool:
         """Return False (a URL is not a local filesystem path)."""
@@ -812,7 +824,26 @@ def _print_version(ctx: click.Context, param: click.Parameter, value: bool) -> N
     ctx.exit()
 
 
-@click.group(context_settings={"help_option_names": ["-h", "--help"]})
+class _RedactingGroup(click.RichGroup):
+    """A command group whose errors can't show a URL's credentials.
+
+    Commands quote what they were given and what went wrong (click's own
+    ``File '...' does not exist``, ``Failed to load input: {e}``), so every message is
+    masked here, as it leaves.
+    """
+
+    def invoke(self, ctx: click.Context) -> Any:
+        """Run the command, masking the message of any error it raises."""
+        try:
+            return super().invoke(ctx)
+        except click.ClickException as e:
+            e.message = _redact_text(e.message)
+            raise
+
+
+@click.group(
+    cls=_RedactingGroup, context_settings={"help_option_names": ["-h", "--help"]}
+)
 @click.option(
     "--version",
     is_flag=True,
@@ -1372,7 +1403,7 @@ def _format_video_filename(vid: Video) -> str:
     filenames = _get_image_filenames(vid)
     if filenames is not None:
         return f"{len(filenames)} images"
-    return Path(vid.filename).name
+    return Path(_display_filename(vid.filename)).name
 
 
 def _truncate_path_left(path_str: str, max_width: int) -> str:
@@ -1475,7 +1506,8 @@ def _print_video_summary(labels: Labels) -> None:
         if filenames is not None:
             path_display = f"{len(filenames)} images"
         else:
-            path_display = _truncate_path_left(str(vid.filename), 80)
+            # Masked first: truncating keeps the end of a URL, away from its names.
+            path_display = _truncate_path_left(str(_display_filename(vid.filename)), 80)
 
         idx_str = f"[dim][{i}][/]"
         console.print(
@@ -1493,7 +1525,10 @@ def _print_video_summary(labels: Labels) -> None:
             if filenames is not None:
                 path_display = f"{len(filenames)} images"
             else:
-                path_display = _truncate_path_left(str(vid.filename), 80)
+                # Masked first: truncating keeps the end of a URL, away from its names.
+                path_display = _truncate_path_left(
+                    str(_display_filename(vid.filename)), 80
+                )
 
             tag = ""
             if not vid.exists() and not isinstance(vid.filename, list):
@@ -1565,12 +1600,12 @@ def _print_video_details(labels: Labels, video_index: int | None = None) -> None
         # Path/Source info based on video type
         if filenames is not None:
             # Image sequence - show first/last
-            console.print(f"  [dim]First[/]     {filenames[0]}")
+            console.print(f"  [dim]First[/]     {_display_filename(filenames[0])}")
             if len(filenames) > 1:
-                console.print(f"  [dim]Last[/]      {filenames[-1]}")
+                console.print(f"  [dim]Last[/]      {_display_filename(filenames[-1])}")
             # Show full path of first image
             full_path = Path(filenames[0]).resolve()
-            if str(full_path) != filenames[0]:
+            if str(full_path) != filenames[0] and not _is_url(filenames[0]):
                 console.print(f"  [dim]Full[/]      {full_path.parent}/")
         elif is_embedded:
             # Embedded video - show source if available
@@ -1578,7 +1613,9 @@ def _print_video_details(labels: Labels, video_index: int | None = None) -> None
             if isinstance(vid.backend, HDF5Video) and vid.backend.source_filename:
                 source_filename = vid.backend.source_filename
             if source_filename:
-                console.print(f"  [dim]Source[/]    {source_filename}")
+                console.print(
+                    f"  [dim]Source[/]    {_display_filename(source_filename)}"
+                )
             if dataset:
                 console.print(f"  [dim]Dataset[/]   {dataset}")
             # Show format info if backend is loaded
@@ -1588,9 +1625,9 @@ def _print_video_details(labels: Labels, video_index: int | None = None) -> None
                 console.print(f"  [dim]Format[/]    {fmt} ({order})")
         else:
             # Regular file - show path
-            console.print(f"  [dim]Path[/]      {vid.filename}")
+            console.print(f"  [dim]Path[/]      {_display_filename(vid.filename)}")
             # Show full path if different from stored path
-            if isinstance(vid.filename, str):
+            if isinstance(vid.filename, str) and not _is_url(vid.filename):
                 full_path = Path(vid.filename).resolve()
                 if str(full_path) != vid.filename:
                     console.print(f"  [dim]Full[/]      {full_path}")
@@ -1637,7 +1674,11 @@ def _print_video_details(labels: Labels, video_index: int | None = None) -> None
             console.print("  [dim]Source Video[/]")
 
             # Source video type and filename
-            src_fname = Path(src.filename).name if isinstance(src.filename, str) else ""
+            src_fname = (
+                Path(_display_filename(src.filename)).name
+                if isinstance(src.filename, str)
+                else ""
+            )
             if src_fname:
                 console.print(f"  [dim]  File[/]    {src_fname}")
             console.print(f"  [dim]  Type[/]    {src_type}")
@@ -1744,7 +1785,7 @@ def _print_labeled_frame(labels: Labels, frame_idx: int) -> None:
 
     # Video info
     if isinstance(lf.video.filename, str):
-        video_name = Path(lf.video.filename).name
+        video_name = Path(_display_filename(lf.video.filename)).name
     else:
         video_name = f"{len(lf.video.filename)} images"
     console.print(f"  [dim]Video:[/]     {video_name}")
@@ -1793,6 +1834,29 @@ def _print_labeled_frame(labels: Labels, frame_idx: int) -> None:
         console.print(f"    [green]points = {points_str}[/]")
 
 
+def _redacted_provenance(labels: Labels) -> dict:
+    """Return a copy of a file's provenance fit to show, with credentials masked.
+
+    Args:
+        labels: Labels object holding the provenance.
+
+    Returns:
+        The provenance with :func:`~sleap_io.io._remote._redact_text` applied to every
+        string in it, at any depth.
+    """
+
+    def redact(value: Any) -> Any:
+        if isinstance(value, str):
+            return _redact_text(value)
+        if isinstance(value, dict):
+            return {k: redact(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [redact(v) for v in value]
+        return value
+
+    return redact(dict(labels.provenance))
+
+
 def _print_provenance(labels: Labels, compact: bool = False) -> None:
     """Print provenance information.
 
@@ -1811,7 +1875,7 @@ def _print_provenance(labels: Labels, compact: bool = False) -> None:
     console.print("[bold cyan]Provenance[/]")
     console.print()
 
-    for key, value in labels.provenance.items():
+    for key, value in _redacted_provenance(labels).items():
         if isinstance(value, (dict, list)):
             if compact:
                 # Compact mode: show summary
@@ -1904,7 +1968,7 @@ def _build_video_dict(vid: Video, index: int, n_labeled_frames: int) -> dict:
 
     d: dict[str, Any] = {
         "index": index,
-        "filename": vid.filename,
+        "filename": _display_filename(vid.filename),
         "type": _get_video_type(vid),
         "embedded": is_embedded,
         "exists": bool(vid.exists()),
@@ -1941,7 +2005,7 @@ def _build_video_dict(vid: Video, index: int, n_labeled_frames: int) -> dict:
     if vid.source_video is not None:
         src = vid.source_video
         src_d: dict[str, Any] = {
-            "filename": src.filename,
+            "filename": _display_filename(src.filename),
             "type": _get_video_type(src),
             "shape": None,
         }
@@ -2006,7 +2070,7 @@ def _build_labeled_frame_dict(labels: Labels, frame_idx: int) -> dict:
     return {
         "lf_index": frame_idx,
         "video_index": video_index,
-        "video_filename": lf.video.filename,
+        "video_filename": _display_filename(lf.video.filename),
         "frame_idx": lf.frame_idx,
         "n_instances": len(lf),
         "n_masks": len(lf.masks),
@@ -2161,7 +2225,7 @@ def _build_labels_json(
     video_idx = {id(v): i for i, v in enumerate(labels.videos)}
 
     payload: dict[str, Any] = {
-        "path": str(path.resolve()),
+        "path": _display_filename(str(path.resolve())),
         "name": path.name,
         "size_bytes": file_size,
         "format": "labels_package" if is_pkg else "labels",
@@ -2206,7 +2270,7 @@ def _build_labels_json(
         "events": [
             _build_event_dict(ev, i, video_idx) for i, ev in enumerate(labels.events)
         ],
-        "provenance": dict(labels.provenance),
+        "provenance": _redacted_provenance(labels),
     }
 
     if include_frames:
@@ -2225,7 +2289,7 @@ def _build_video_file_json(path: Path, video: Video) -> dict:
     file_size = path.stat().st_size if path.exists() else None
 
     payload: dict[str, Any] = {
-        "path": str(path.resolve()),
+        "path": _display_filename(str(path.resolve())),
         "name": path.name,
         "size_bytes": file_size,
         "format": "video",
@@ -3878,21 +3942,26 @@ def filenames(
         if as_json:
             videos_payload = []
             for i, vid in enumerate(labels.videos):
-                entry: dict[str, Any] = {"index": i, "filename": vid.filename}
+                entry: dict[str, Any] = {
+                    "index": i,
+                    "filename": _display_filename(vid.filename),
+                }
                 if isinstance(vid.filename, list):
                     entry["n_images"] = len(vid.filename)
                 entry["source"] = (
-                    vid.source_video.filename if vid.source_video is not None else None
+                    _display_filename(vid.source_video.filename)
+                    if vid.source_video is not None
+                    else None
                 )
                 entry["original"] = (
-                    vid.original_video.filename
+                    _display_filename(vid.original_video.filename)
                     if vid.original_video is not None
                     else None
                 )
                 videos_payload.append(entry)
             _echo_json(
                 {
-                    "path": str(input_path.resolve()),
+                    "path": _display_filename(str(input_path.resolve())),
                     "name": input_path.name,
                     "videos": videos_payload,
                 }
@@ -3906,7 +3975,7 @@ def filenames(
 
         click.echo(f"Video filenames in {input_path.name}:")
         for i, vid in enumerate(labels.videos):
-            fn = vid.filename
+            fn = _display_filename(vid.filename)
 
             # Display filename(s)
             if isinstance(fn, list):
@@ -3921,11 +3990,15 @@ def filenames(
 
             # Display source video
             if show_source_effective and vid.source_video is not None:
-                click.echo(f"      Source: {vid.source_video.filename}")
+                click.echo(
+                    f"      Source: {_display_filename(vid.source_video.filename)}"
+                )
 
             # Display original video
             if show_original_effective and vid.original_video is not None:
-                click.echo(f"      Original: {vid.original_video.filename}")
+                click.echo(
+                    f"      Original: {_display_filename(vid.original_video.filename)}"
+                )
 
         return
 
@@ -3999,14 +4072,14 @@ def filenames(
         click.echo(f"Replaced ({len(changed)}/{n_videos}):")
         for i, old, new in changed:
             # For image sequences, show first filename only
-            old_display = old[0] if isinstance(old, list) else old
-            new_display = new[0] if isinstance(new, list) else new
+            old_display = _display_filename(old[0] if isinstance(old, list) else old)
+            new_display = _display_filename(new[0] if isinstance(new, list) else new)
             click.echo(f"  [{i}] {old_display} -> {new_display}")
 
     if unchanged:
         click.echo(f"Unchanged ({len(unchanged)}/{n_videos}):")
         for i, old in unchanged:
-            old_display = old[0] if isinstance(old, list) else old
+            old_display = _display_filename(old[0] if isinstance(old, list) else old)
             click.echo(f"  [{i}] {old_display}")
 
     click.echo(f"Saved: {output_path}")
@@ -5135,9 +5208,13 @@ def fix(
         )
         if verbose:
             for canonical, duplicates, n_reassign in duplicate_groups:
-                console.print(f"  [dim]Canonical:[/] {canonical.filename}")
+                console.print(
+                    f"  [dim]Canonical:[/] {_display_filename(canonical.filename)}"
+                )
                 for dup in duplicates:
-                    console.print(f"  [dim]  Duplicate:[/] {dup.filename}")
+                    console.print(
+                        f"  [dim]  Duplicate:[/] {_display_filename(dup.filename)}"
+                    )
                 console.print(f"  [dim]  Frames to reassign:[/] {n_reassign}")
     else:
         console.print("[green]✓ Videos:[/] No duplicates found")
@@ -5202,7 +5279,7 @@ def fix(
 
     if verbose or has_color_mismatches:
         for v in video_color_analysis:
-            name = Path(v["filename"]).name
+            name = Path(_display_filename(v["filename"])).name
             if v["mismatch"]:
                 console.print(
                     f"  [yellow]⚠ {name}: setting={v['setting_str']}, "
@@ -5952,7 +6029,7 @@ def _trim_labels(
     frame_inds = np.arange(start_frame, end_frame)
 
     console.print(f"[bold]Trimming:[/] {input_path}")
-    console.print(f"[dim]  Video: {video.filename}[/]")
+    console.print(f"[dim]  Video: {_display_filename(video.filename)}[/]")
     console.print(
         f"[dim]  Frame range: {start_frame} to {end_frame} "
         f"({len(frame_inds)} frames)[/]"
@@ -6612,7 +6689,8 @@ def _reencode_video_object(
     # Check backend type
     if isinstance(backend, (ImageVideo, TiffVideo)):
         console.print(
-            f"[yellow]Skipping {video.filename}: {backend_type} cannot be reencoded[/]"
+            f"[yellow]Skipping {_display_filename(video.filename)}: "
+            f"{backend_type} cannot be reencoded[/]"
         )
         return None
 
@@ -6640,11 +6718,13 @@ def _reencode_video_object(
     if use_ffmpeg is True and not can_use_ffmpeg:
         if isinstance(backend, HDF5Video):
             raise click.ClickException(
-                f"Cannot use ffmpeg for HDF5 video: {video.filename}\n"
+                "Cannot use ffmpeg for HDF5 video: "
+                f"{_display_filename(video.filename)}\n"
                 "HDF5 videos require the Python path (--no-ffmpeg)."
             )
         raise click.ClickException(
-            f"ffmpeg not available for {backend_type}: {video.filename}"
+            f"ffmpeg not available for {backend_type}: "
+            f"{_display_filename(video.filename)}"
         )
 
     use_ffmpeg_path = can_use_ffmpeg if use_ffmpeg is None else use_ffmpeg
@@ -6712,11 +6792,16 @@ def _reencode_video_object(
         from sleap_io.io.video_writing import VideoWriter
 
         if dry_run:
-            console.print(f"[dim]  Would reencode via Python: {video.filename}[/]")
+            console.print(
+                "[dim]  Would reencode via Python: "
+                f"{_display_filename(video.filename)}[/]"
+            )
             console.print(f"[dim]  Output: {output_path}[/]")
             return None
 
-        console.print(f"[bold]Reencoding (Python):[/] {video.filename}")
+        console.print(
+            f"[bold]Reencoding (Python):[/] {_display_filename(video.filename)}"
+        )
         console.print(f"[dim]  Output: {output_path}[/]")
 
         # Get input FPS
@@ -6852,7 +6937,7 @@ def _reencode_slp(
         # Skip unsupported backends
         if isinstance(backend, (ImageVideo, TiffVideo)):
             console.print(
-                f"[yellow]  Skipping: {video.filename}[/]\n"
+                f"[yellow]  Skipping: {_display_filename(video.filename)}[/]\n"
                 f"[dim]  Reason: {backend_type} cannot be reencoded[/]"
             )
             skipped_count += 1
@@ -6860,7 +6945,7 @@ def _reencode_slp(
 
         if backend is None:
             console.print(
-                f"[yellow]  Skipping: {video.filename}[/]\n"
+                f"[yellow]  Skipping: {_display_filename(video.filename)}[/]\n"
                 "[dim]  Reason: Video backend not loaded[/]"
             )
             skipped_count += 1
@@ -6873,7 +6958,7 @@ def _reencode_slp(
         # Check if output video exists
         if output_video_path.exists() and not overwrite:
             console.print(
-                f"[yellow]  Skipping: {video.filename}[/]\n"
+                f"[yellow]  Skipping: {_display_filename(video.filename)}[/]\n"
                 f"[dim]  Reason: Output exists: {output_video_path}[/]"
             )
             skipped_count += 1
@@ -6910,7 +6995,9 @@ def _reencode_slp(
         except click.ClickException:
             raise
         except Exception as e:
-            console.print(f"[red]  Error reencoding {video.filename}: {e}[/]")
+            console.print(
+                f"[red]  Error reencoding {_display_filename(video.filename)}: {e}[/]"
+            )
             skipped_count += 1
             continue
 
@@ -8420,7 +8507,8 @@ def transform(
             input_sizes.append((w, h))
         else:
             raise click.ClickException(
-                f"Cannot determine dimensions for video: {video.filename}"
+                "Cannot determine dimensions for video: "
+                f"{_display_filename(video.filename)}"
             )
 
     # Build transforms from config file first (lowest precedence)
@@ -8469,7 +8557,7 @@ def transform(
     for video_info in summary["videos"]:
         if video_info["has_transform"]:
             idx = video_info["index"]
-            fname = video_info["filename"]
+            fname = _display_filename(video_info["filename"])
             console.print(f"\n  [bold]Video {idx}:[/] {fname}")
             if video_info.get("input_size") and video_info.get("output_size"):
                 in_w, in_h = video_info["input_size"]

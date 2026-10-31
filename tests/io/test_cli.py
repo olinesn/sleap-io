@@ -533,6 +533,157 @@ def test_fix_url_input_dry_run_redacts_credentials():
     assert "Traceback" not in out
 
 
+def test_remote_input_path_format_masks_credentials():
+    """An f-string shows a URL input masked; `str` keeps it whole for the loaders."""
+    url = "https://host/a/b/data.slp?token=secret&keep=ok"
+    p = _RemoteInputPath(url)
+    assert f"{p}" == "https://host/a/b/data.slp?token=%2A%2A%2A&keep=ok"
+    assert "secret" not in f"{p:>80}"
+    assert "secret" not in f"{p.parent}"
+    assert "secret" not in f"{p.with_suffix('.nwb')}"
+    assert str(p) == url
+    assert os.fspath(p) == url
+
+
+def _without_wrapping(text: str) -> str:
+    """Remove what rich's wrapping and panels put inside a long line of output."""
+    return re.sub(r"[\s│╭╮╰╯─]+", "", _strip_ansi(text))
+
+
+def _serve_with_ranges(httpserver, path, data):
+    """Serve `data` with the HEAD and Range support a remote `.slp` needs."""
+
+    def handler(request):
+        total = len(data)
+        ranges = {"Accept-Ranges": "bytes"}
+        if request.method == "HEAD":
+            resp = Response(b"", headers=ranges)
+            resp.headers["Content-Length"] = str(total)
+            return resp
+        if "Range" not in request.headers:
+            return Response(data, headers=ranges)
+        start_s, _, end_s = request.headers["Range"].split("=", 1)[1].partition("-")
+        start = int(start_s)
+        end = min(int(end_s) if end_s else total - 1, total - 1)
+        ranges["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return Response(data[start : end + 1], status=206, headers=ranges)
+
+    httpserver.expect_request(path).respond_with_handler(handler)
+
+
+#: A signed URL's query, long enough that a table shortening its end can't keep a name.
+_SIGNED_QUERY = (
+    "X-Amz-Credential=AKIAEXAMPLE&X-Amz-Expires=3600&X-Amz-Signature=" + "5c0f3e7a" * 16
+)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["show", "{url}"],
+        ["show", "{url}", "--video"],
+        ["show", "{url}", "--provenance"],
+        ["show", "{url}", "--json"],
+        ["show", "{url}", "--lf", "0"],
+        ["filenames", "{url}"],
+        ["filenames", "{url}", "--json"],
+        ["convert", "{url}", "-o", "{tmp}/out.slp"],
+        ["split", "{url}", "-o", "{tmp}/split"],
+        ["fix", "{url}", "--dry-run"],
+    ],
+    ids=lambda args: " ".join(a for a in args if "{" not in a),
+)
+def test_url_input_output_hides_credentials(httpserver, tmp_path, slp_minimal, args):
+    """Commands report a URL input masked, and the load still gets the whole URL."""
+    _serve_with_ranges(httpserver, "/labels.slp", Path(slp_minimal).read_bytes())
+    url = httpserver.url_for("/labels.slp") + f"?{_SIGNED_QUERY}"
+
+    result = CliRunner().invoke(cli, [a.format(url=url, tmp=tmp_path) for a in args])
+
+    assert result.exit_code == 0, result.output
+    out = _without_wrapping(result.output)
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.fixture
+def slp_holding_urls(tmp_path, slp_minimal):
+    """A local `.slp` whose video names and provenance are a signed URL.
+
+    Older saves wrote a video's URL as it was, credentials included.
+    """
+    # Nothing listens on this port, so checking whether the video exists is quick.
+    url = f"http://127.0.0.1:9/session/video.mp4?{_SIGNED_QUERY}"
+    labels = load_slp(slp_minimal, open_videos=False)
+    video = labels.videos[0]
+    video.replace_filename(url, open=False)
+    video.source_video = Video(filename=url, open_backend=False)
+    labels.provenance["filename"] = url
+    labels.provenance["nested"] = {"urls": [url]}
+    path = tmp_path / "holding_urls.slp"
+    save_slp(labels, str(path), embed=False)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["show"],
+        ["show", "--video"],
+        ["show", "--provenance"],
+        ["show", "--json"],
+        ["show", "--lf", "0"],
+        ["filenames"],
+        ["filenames", "--all"],
+        ["filenames", "--json"],
+        ["fix", "--dry-run"],
+    ],
+    ids=" ".join,
+)
+def test_local_file_holding_urls_output_hides_credentials(slp_holding_urls, args):
+    """Names stored in a file are shown masked: its URL is no safer than a typed one."""
+    command, *flags = args
+    result = CliRunner().invoke(cli, [command, slp_holding_urls, *flags])
+
+    assert result.exit_code == 0, result.output
+    out = _without_wrapping(result.output)
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+def test_show_video_table_shortens_a_url_after_masking_it(slp_holding_urls):
+    """The table keeps a long name's end, which for a URL is where a signature is."""
+    result = CliRunner().invoke(cli, ["show", slp_holding_urls])
+
+    out = _without_wrapping(result.output)
+    assert "X-Amz-Signature=%2A%2A%2A" in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["trim", "{url}", "-o", "{tmp}/out.slp"],
+        ["reencode", "{url}", "-o", "{tmp}/out.mp4"],
+        ["merge", "{url}", "{url}", "-o", "{tmp}/out.slp"],
+        ["transform", "{url}", "-o", "{tmp}/out.slp"],
+        ["unsplit", "{url}", "-o", "{tmp}/out.slp"],
+        ["apply-crops", "{url}", "-o", "{tmp}/out.slp"],
+    ],
+    ids=lambda args: args[0],
+)
+def test_local_only_command_refusing_a_url_hides_credentials(tmp_path, args):
+    """Click's own error quotes what it was given, so that's masked on the way out."""
+    url = f"https://host.invalid/a.slp?{_SIGNED_QUERY}"
+    result = CliRunner().invoke(cli, [a.format(url=url, tmp=tmp_path) for a in args])
+
+    assert result.exit_code != 0
+    out = _without_wrapping(result.output)
+    assert "doesnotexist" in out
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
 def test_fix_url_input_dry_run_hides_signed_url_credentials():
     """`sio fix <signed url> --dry-run` shows no signature, access key or API key."""
     runner = CliRunner()
