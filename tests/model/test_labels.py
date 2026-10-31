@@ -637,6 +637,18 @@ def test_match_video_definitive_over_basename():
     assert labels.match_video("/dir2/vid.mp4") is v2
 
 
+def test_save_over_embedded_video_hides_url_credentials(tmp_path, slp_minimal_pkg):
+    """Refusing to overwrite an embedded video names a URL without its credentials."""
+    labels = load_slp(slp_minimal_pkg)
+    url = "https://host/out.pkg.slp?token=SECRET"
+    labels.videos[0].filename = url
+    labels.videos[0].source_video = None
+
+    with pytest.raises(ValueError, match="Cannot save with embed=False") as ei:
+        labels.save(url, format="slp", embed=False)
+    assert "SECRET" not in str(ei.value)
+
+
 def test_match_video_ambiguous_hides_url_credentials():
     """The ambiguous-match error names URLs without their credentials."""
     query = "https://c.test/vid.mp4?token=SECRET"

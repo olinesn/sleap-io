@@ -1910,7 +1910,8 @@ class Labels:
                         raise ValueError(
                             f"Cannot save with embed=False when overwriting a file "
                             f"that contains embedded videos. Use "
-                            f"labels.save('{filename}', embed=True) to re-embed the "
+                            f"labels.save('{_display_filename(filename)}', embed=True) "
+                            "to re-embed the "
                             f"frames, or save to a different filename."
                         )
 

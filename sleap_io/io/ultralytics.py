@@ -25,6 +25,7 @@ import numpy as np
 import yaml
 from tqdm import tqdm
 
+from sleap_io.io._remote import _display_filename
 from sleap_io.model.bbox import BoundingBox, PredictedBoundingBox, UserBoundingBox
 from sleap_io.model.instance import Instance, Track
 from sleap_io.model.labeled_frame import LabeledFrame
@@ -297,7 +298,7 @@ def _save_frame_image(args: tuple[dict, str, int | None]) -> str | None:
     except Exception as e:
         warnings.warn(
             f"Error processing frame {frame_data['frame_idx']} from "
-            f"{frame_data['video_path']}: {str(e)}"
+            f"{_display_filename(frame_data['video_path'])}: {str(e)}"
         )
         return None
 
@@ -648,7 +649,8 @@ def _write_bbox_labels(
 
                 height_px, width_px = frame_img.shape[:2]
             except Exception as e:
-                warnings.warn(f"Error processing {video_path}: {e}, skipping.")
+                shown = _display_filename(video_path)
+                warnings.warn(f"Error processing {shown}: {e}, skipping.")
                 continue
 
             # Write label file
@@ -758,7 +760,8 @@ def _write_roi_labels(
 
                 height_px, width_px = frame_img.shape[:2]
             except Exception as e:
-                warnings.warn(f"Error processing {video_path}: {e}, skipping.")
+                shown = _display_filename(video_path)
+                warnings.warn(f"Error processing {shown}: {e}, skipping.")
                 continue
 
             # Write label file
