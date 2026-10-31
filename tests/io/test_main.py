@@ -969,6 +969,32 @@ def test_load_file_url_unknown_extension_redacts_credentials():
     assert "example.com" in message
 
 
+@pytest.mark.parametrize(
+    "filename,kwargs",
+    [
+        ("data.slp", {"format": "not_a_real_format"}),
+        ("data.slp", {"format": "coco"}),
+        ("data.h5", {"sniff": False}),
+        ("data.unknownext", {}),
+    ],
+)
+def test_load_file_url_errors_hide_signed_url_credentials(filename, kwargs):
+    """URL dispatch errors show no signature, access key or API key.
+
+    No network request is issued: each error is raised before any I/O.
+    """
+    url = (
+        f"https://example.com/{filename}?X-Amz-Credential=AKIAEXAMPLE"
+        "&X-Amz-Signature=TOPSECRET&Signature=TOPSECRET&key=TOPSECRET"
+    )
+    with pytest.raises((ValueError, NotImplementedError)) as exc_info:
+        load_file(url, **kwargs)
+    message = str(exc_info.value)
+    assert "AKIAEXAMPLE" not in message
+    assert "TOPSECRET" not in message
+    assert "example.com" in message
+
+
 def test_load_file_url_unrecognized_content_redacts_credentials(httpserver):
     """A sniffed-but-unsupported body raises with a redacted URL (S4).
 
@@ -1278,6 +1304,18 @@ def test_load_file_gdrive_url_unsupported_format_message(gdrive_uc_template):
     # Must not reuse the misleading generic "Download the file locally first."
     # wording (the user already paid the download cost).
     assert "Download the file locally first." not in msg
+
+
+def test_load_file_gdrive_url_unsupported_format_hides_api_key(gdrive_uc_template):
+    """The Drive-specific unsupported-format error shows no API key from the URL."""
+    buf = io.BytesIO()
+    with h5py.File(buf, "w") as f:
+        f.create_dataset("track_occupancy", data=np.zeros((1, 1)))
+    _serve_gdrive_bytes(gdrive_uc_template, buf.getvalue())
+
+    with pytest.raises(NotImplementedError, match="after a full download") as ei:
+        load_file("https://drive.google.com/file/d/FILEID/view?key=TOPSECRET")
+    assert "TOPSECRET" not in str(ei.value)
 
 
 def test_gdrive_format_from_bytes_hdf5_slp():

@@ -533,6 +533,20 @@ def test_fix_url_input_dry_run_redacts_credentials():
     assert "Traceback" not in out
 
 
+def test_fix_url_input_dry_run_hides_signed_url_credentials():
+    """`sio fix <signed url> --dry-run` shows no signature, access key or API key."""
+    runner = CliRunner()
+    url = (
+        "https://invalid.invalid.invalid/x.slp?X-Amz-Credential=AKIAEXAMPLE"
+        "&X-Amz-Signature=supersecret&key=supersecret"
+    )
+    result = runner.invoke(cli, ["fix", url, "--dry-run"])
+    out = _strip_ansi(result.output)
+    assert "Loading:" in out
+    assert "AKIAEXAMPLE" not in out
+    assert "supersecret" not in out
+
+
 def test_embed_url_input_passes_suffix_gate(tmp_path):
     """`sio embed <url-with-query>` passes the .slp suffix gate and reaches load.
 

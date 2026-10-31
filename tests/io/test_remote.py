@@ -42,6 +42,7 @@ from sleap_io.io._gdrive import (
 from sleap_io.io._remote import (
     _CACHE_MARKER_NAME,
     _RETRY_BACKOFF_BASE,
+    _SENSITIVE_QUERY_PARAMS,
     RemoteIOError,
     _build_fsspec_filesystem,
     _filename_from_url,
@@ -211,6 +212,125 @@ def test_redact_url_userinfo_and_token_combined():
     assert "TOK" not in out
     assert "SAS" not in out
     assert "***:***@host" in out
+
+
+#: Query strings as the real SDKs and services write them (every value is made up),
+#: each with the credentials it must never show. These are spelled out rather than
+#: read from ``_SENSITIVE_QUERY_PARAMS``, or the tests would pass however short that
+#: list got.
+_SIGNED_QUERIES = [
+    pytest.param(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20261031%2Fus-east-1%2Fs3"
+        "%2Faws4_request&X-Amz-Date=20261031T092209Z&X-Amz-Expires=3600"
+        "&X-Amz-SignedHeaders=host&X-Amz-Signature=" + "a18d00a0" * 8,
+        ["AKIAIOSFODNN7EXAMPLE", "a18d00a0"],
+        id="s3-v4",
+    ),
+    pytest.param(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256"
+        "&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20261031%2Fus-east-1%2Fs3"
+        "%2Faws4_request&X-Amz-Date=20261031T092209Z&X-Amz-Expires=3600"
+        "&X-Amz-SignedHeaders=host"
+        "&X-Amz-Security-Token=e9%2BN0ULH%2BIzMoheNK6B%2FTZAlCYMfPBdgVX%3D"
+        "&X-Amz-Signature=" + "a18d00a0" * 8,
+        ["AKIAIOSFODNN7EXAMPLE", "IzMoheNK6B", "TZAlCYMfPBdgVX", "a18d00a0"],
+        id="s3-v4-session",
+    ),
+    pytest.param(
+        "AWSAccessKeyId=AKIAIOSFODNN7EXAMPLE"
+        "&Signature=Jrotie1L6y7%2BWzLpFmnOPJxBX0B%3D&Expires=1793442129",
+        ["AKIAIOSFODNN7EXAMPLE", "Jrotie1L6y7", "WzLpFmnOPJxBX0B"],
+        id="s3-v2",
+    ),
+    pytest.param(
+        "X-Goog-Algorithm=GOOG4-RSA-SHA256"
+        "&X-Goog-Credential=sleap-reader%40lab-project.iam.gserviceaccount.com"
+        "%2F20261031%2Fauto%2Fstorage%2Fgoog4_request&X-Goog-Date=20261031T092209Z"
+        "&X-Goog-Expires=3600&X-Goog-SignedHeaders=host"
+        "&X-Goog-Signature=" + "5c0f3e7a" * 64,
+        ["sleap-reader", "5c0f3e7a"],
+        id="cloud-storage-v4",
+    ),
+    pytest.param(
+        "Expires=1793442129"
+        "&GoogleAccessId=sleap-reader%40lab-project.iam.gserviceaccount.com"
+        "&Signature=u3Ii7a729J0Nca%2FU4pThvtEZ8R%2BR8XVKLGb2YC%3D",
+        ["sleap-reader", "u3Ii7a729J0Nca", "U4pThvtEZ8R", "R8XVKLGb2YC"],
+        id="cloud-storage-v2",
+    ),
+    pytest.param(
+        "se=2026-11-01T00%3A00%3A00Z&sp=r&sv=2026-10-06&sr=b"
+        "&sig=ry8L1PvwhyaF1Q%2BZPDWSmTbUgMKnaOc%3D",
+        ["ry8L1PvwhyaF1Q", "ZPDWSmTbUgMKnaOc"],
+        id="azure-sas",
+    ),
+    pytest.param(
+        "Expires=1767290400&Signature=nitfHRCrtziwO2HwPfWw~yYDhUF5EwRunQA-j19Dz"
+        "&Key-Pair-Id=K2JCJMDEHXQW5F&Hash-Algorithm=SHA256",
+        ["nitfHRCrtziwO2HwPfWw"],
+        id="cloudfront",
+    ),
+    pytest.param(
+        "Authorization=3_20261031000000_0123456789abcdef_d002_acct_download",
+        ["0123456789abcdef"],
+        id="backblaze-b2",
+    ),
+    pytest.param(
+        "alt=media&key=NotARealGoogleKey0123456789", ["NotARealGoogleKey"], id="key"
+    ),
+    pytest.param("KEY=NotARealKey0123456789", ["NotARealKey"], id="key-uppercase"),
+    pytest.param("api_key=NotARealKey0123456789&v=2", ["NotARealKey"], id="api_key"),
+    pytest.param("v=2&apikey=NotARealKey0123456789", ["NotARealKey"], id="apikey"),
+    pytest.param("api-key=NotARealKey0123456789", ["NotARealKey"], id="api-key"),
+]
+
+
+@pytest.mark.parametrize("query,credentials", _SIGNED_QUERIES)
+def test_redact_url_hides_signed_url_credentials(query, credentials):
+    """Signed URLs and API keys show no credential once redacted."""
+    out = _redact_url(f"https://host.example/session1/labels.slp?{query}")
+    assert out.startswith("https://host.example/session1/labels.slp?")
+    for credential in credentials:
+        assert credential not in out
+
+
+@pytest.mark.parametrize("name", sorted(_SENSITIVE_QUERY_PARAMS))
+def test_redact_url_hides_every_listed_name_in_any_case(name):
+    """Each listed name is masked however it is capitalized, and nothing else is."""
+    for spelled in (name, name.upper(), name.title()):
+        out = _redact_url(f"https://host/x?{spelled}=SECRETVALUE&keep=ok")
+        assert "SECRETVALUE" not in out
+        assert f"{spelled}=" in out
+        assert "keep=ok" in out
+
+
+def test_redact_url_keeps_what_says_why_a_signed_url_failed():
+    """Expiry times, algorithms and public IDs aren't secret, so they stay visible."""
+    query = (
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Date=20261031T092209Z"
+        "&X-Amz-Expires=3600&X-Amz-SignedHeaders=host"
+        "&X-Goog-Algorithm=GOOG4-RSA-SHA256&X-Goog-Date=20261031T092209Z"
+        "&X-Goog-Expires=3600&X-Goog-SignedHeaders=host&Expires=1793442129"
+        "&se=2026-11-01T00%3A00%3A00Z&sp=r&sv=2026-10-06&sr=b&skoid=1111&sktid=2222"
+        "&Key-Pair-Id=K2JCJMDEHXQW5F&Hash-Algorithm=SHA256"
+    )
+    assert _redact_url(f"https://host/x?{query}") == f"https://host/x?{query}"
+
+
+def test_redact_url_matches_whole_names_only():
+    """A param whose name only contains a listed name keeps its value."""
+    url = (
+        "https://host/x?monkey=a&keyframe=1&signature_version=s3v4"
+        "&api_key_id=7&tokens=3&x-amz-signature-version=4"
+    )
+    assert _redact_url(url) == url
+
+
+def test_redact_url_ordinary_key_param_hides_only_its_value():
+    """``key`` is often an ordinary param; masking it costs one value in a message."""
+    out = _redact_url("https://proxy.example/get?key=videos/a.mp4&other=1")
+    assert out == "https://proxy.example/get?key=%2A%2A%2A&other=1"
 
 
 # ---------------------------------------------------------------------------
@@ -886,6 +1006,69 @@ def test_credentials_redacted_in_errors(httpserver):
     assert e.__suppress_context__ is True
 
 
+def _everything_shown(e: RemoteIOError) -> str:
+    """Return all the text an error can show: its whole traceback and its fields.
+
+    Args:
+        e: The error to read.
+
+    Returns:
+        The formatted traceback (which walks ``__cause__``/``__context__``), plus the
+        ``url`` and ``cause_summary`` attributes.
+    """
+    formatted = "".join(traceback.format_exception(type(e), e, e.__traceback__))
+    return f"{formatted}\n{e.url}\n{e.cause_summary}"
+
+
+@pytest.mark.parametrize("query,credentials", _SIGNED_QUERIES)
+def test_refused_signed_url_shows_no_credential(
+    httpserver, tmp_path, query, credentials
+):
+    """A signed URL refused with a 403 shows no credential, however it is opened."""
+    httpserver.expect_request("/session1/labels.slp").respond_with_data(
+        "denied", status=403
+    )
+    url = httpserver.url_for("/session1/labels.slp") + f"?{query}"
+
+    with pytest.raises(RemoteIOError) as opened:
+        open_url(url, retries=0)
+    with pytest.raises(RemoteIOError) as downloaded:
+        download(url, tmp_path / "labels.slp", retries=0, progress=False)
+
+    for e in (opened.value, downloaded.value):
+        assert e.status == 403
+        shown = _everything_shown(e)
+        for credential in credentials:
+            assert credential not in shown
+
+
+def test_redirect_to_signed_url_shows_no_credential(httpserver, tmp_path):
+    """A failure after a redirect names the signed target with credentials hidden.
+
+    The URL given by the caller is clean, so only the masking of the error's own text
+    can hide what the redirect target carries.
+    """
+    query = "X-Amz-Expires=3600&X-Amz-Credential=AKIAEXAMPLE&X-Amz-Signature=TOPSECRET"
+    httpserver.expect_request("/labels.slp").respond_with_data(
+        "", status=302, headers={"Location": f"/signed.slp?{query}"}
+    )
+    httpserver.expect_request("/signed.slp").respond_with_data("denied", status=403)
+
+    with pytest.raises(RemoteIOError) as ei:
+        download(
+            httpserver.url_for("/labels.slp"),
+            tmp_path / "labels.slp",
+            retries=0,
+            progress=False,
+        )
+
+    shown = _everything_shown(ei.value)
+    assert "signed.slp" in shown
+    assert "X-Amz-Expires=3600" in shown
+    assert "AKIAEXAMPLE" not in shown
+    assert "TOPSECRET" not in shown
+
+
 # ---------------------------------------------------------------------------
 # Network: HTTP-status mapping through open_url
 # ---------------------------------------------------------------------------
@@ -1410,6 +1593,16 @@ def test_parse_gdrive_redacts_credentials_in_error():
     """A token in an unparsable URL is redacted in the raised error."""
     with pytest.raises(ValueError) as ei:
         _parse_gdrive("https://drive.google.com/nope?token=SECRET")
+    assert "SECRET" not in str(ei.value)
+
+
+@pytest.mark.parametrize(
+    "path", ["nope", "drive/folders/abc"], ids=["unparsable", "folder"]
+)
+def test_parse_gdrive_hides_api_key_in_error(path):
+    """An API key on a Drive URL we can't use is hidden in the raised error."""
+    with pytest.raises(ValueError) as ei:
+        _parse_gdrive(f"https://drive.google.com/{path}?key=SECRET")
     assert "SECRET" not in str(ei.value)
 
 
@@ -1966,6 +2159,21 @@ def test_download_rejects_unsupported_scheme_and_redacts_credentials():
     assert "expects a remote URL" in msg
 
 
+@pytest.mark.parametrize(
+    "url,match",
+    [
+        ("ftp://host/file.slp", "expects a remote URL"),
+        ("https://host.invalid/", "Could not determine a destination filename"),
+    ],
+)
+def test_download_errors_hide_signed_url_credentials(url, match):
+    """Errors raised before any request show no signature or access key."""
+    with pytest.raises(ValueError, match=match) as exc:
+        download(f"{url}?X-Amz-Credential=AKIAEXAMPLE&X-Amz-Signature=TOPSECRET")
+    assert "AKIAEXAMPLE" not in str(exc.value)
+    assert "TOPSECRET" not in str(exc.value)
+
+
 # ---------------------------------------------------------------------------
 # download(): over HTTP (loopback pytest-httpserver)
 # ---------------------------------------------------------------------------
@@ -2252,3 +2460,14 @@ def test_download_gdrive_no_filename_dir_dest_raises(gdrive_uc_template, tmp_pat
 
     with pytest.raises(ValueError, match="determine a destination filename"):
         download("https://drive.google.com/uc?id=FILEID", tmp_path)
+
+
+def test_download_gdrive_no_filename_error_hides_api_key(gdrive_uc_template, tmp_path):
+    """The Drive no-filename error shows no API key from the URL."""
+    gdrive_uc_template.expect_request("/uc").respond_with_data(
+        _HDF5_BODY, content_type="application/octet-stream"
+    )
+
+    with pytest.raises(ValueError, match="determine a destination filename") as ei:
+        download("https://drive.google.com/uc?id=FILEID&key=TOPSECRET", tmp_path)
+    assert "TOPSECRET" not in str(ei.value)

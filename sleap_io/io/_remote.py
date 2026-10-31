@@ -61,8 +61,37 @@ _GDRIVE_HOSTS = frozenset({"drive.google.com", "docs.google.com"})
 _SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
 
 #: Query-string parameter names whose values are redacted by :func:`_redact_url`.
+#: Lowercase, and matched whole (``monkey=`` and ``signature_version=`` stay visible).
+#: A name goes here if a service really puts a credential there: masking an ordinary
+#: param (``key`` often is one) only hides a value in a message, and the caller still
+#: has the URL. What says why a signed URL failed (``X-Amz-Date``, ``X-Amz-Expires``,
+#: ``Expires``, ``se``, ...) isn't secret and stays visible on purpose.
 _SENSITIVE_QUERY_PARAMS = frozenset(
-    {"token", "access_token", "x-amz-security-token", "sas", "sig"}
+    {
+        "token",
+        "access_token",
+        "x-amz-security-token",
+        "sas",
+        "sig",
+        # S3 and everything S3-compatible (R2, MinIO, B2's S3 API, Wasabi). The access
+        # key ID isn't secret on its own, but it names the account.
+        "x-amz-signature",
+        "x-amz-credential",
+        "awsaccesskeyid",
+        # Cloud Storage. The credential is the service account's email.
+        "x-goog-signature",
+        "x-goog-credential",
+        "googleaccessid",
+        # The older S3 and Cloud Storage forms, and CloudFront.
+        "signature",
+        # Backblaze B2's own download URLs.
+        "authorization",
+        # API keys. Google's APIs take theirs as ``?key=``.
+        "key",
+        "api_key",
+        "apikey",
+        "api-key",
+    }
 )
 
 #: Magic-byte prefixes mapped to a format family (checked in order).
@@ -215,8 +244,10 @@ def _redact_url(url: str) -> str:
     """Strip credentials from a URL for safe logging/error display.
 
     ``https://user:pass@host/path?token=xyz`` becomes
-    ``https://***:***@host/path?token=%2A%2A%2A``. Userinfo is replaced and
-    token-like query parameters have their values redacted.
+    ``https://***:***@host/path?token=%2A%2A%2A``. Userinfo is replaced and the
+    query parameters in :data:`_SENSITIVE_QUERY_PARAMS` (tokens, signed URLs'
+    signatures and access keys, API keys) have their values redacted. The result
+    is for display only: the original URL is what gets requested.
 
     Args:
         url: The URL to redact.

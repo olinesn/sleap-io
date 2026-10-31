@@ -251,12 +251,12 @@ instance metadata).
     (e.g. to a pre-signed CDN URL), put the credentials in the redirect
     target's query string rather than in `headers`.
 
-Other security guarantees: TLS is always on; URLs are redacted (userinfo and
-token-like query parameters stripped) in error messages and tracebacks so
-credentials never leak into logs; and an identity `Accept-Encoding` is forced
-so range reads stay byte-exact. Remote loading needs `aiohttp >= 3.13.5` for
-the cross-origin header stripping — an older version emits a `RuntimeWarning`
-at import time.
+Other security guarantees: TLS is always on; URLs are redacted (userinfo, tokens,
+signed URLs' signatures and access keys, and API keys stripped) in error messages
+and tracebacks so credentials never leak into logs; and an identity
+`Accept-Encoding` is forced so range reads stay byte-exact. Remote loading needs
+`aiohttp >= 3.13.5` for the cross-origin header stripping — an older version emits
+a `RuntimeWarning` at import time.
 
 ---
 
@@ -388,6 +388,11 @@ except sio.RemoteIOError as e:
     print(e.status)  # e.g. 404, 416, 503, or None for connection errors
     print(e.url)     # redacted URL (tokens/userinfo stripped)
 ```
+
+A signed URL's expiry and signing details (`X-Amz-Expires`, `X-Goog-Date`, `se`,
+...) stay visible, because they often say why it failed. A query parameter that
+only happens to be called `key` is hidden in messages too (`key=%2A%2A%2A`); the
+request itself still carries its value.
 
 Only transient statuses (`429`, `500`, `502`, `503`, `504`) are retried (with
 exponential backoff, honoring an integer `Retry-After`); the retry count is
