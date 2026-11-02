@@ -425,6 +425,13 @@ controlled by `retries=` (default 3).
 - **`ValueError` for a URL** — an ambiguous-extension URL (`.h5`/`.json`/`.csv`)
   with `sniff=False` and no explicit `format=`, or a Google Drive folder /
   unparsable link.
+- **A test that reads from a server in its own process hangs** — h5py holds a
+  global lock while it reads a URL, and the read waits for the server. If the
+  garbage collector runs on the server's thread and frees an h5py object, it waits
+  for that lock too, and neither can go on. Turn the collector off during such a
+  test (`gc.collect()`, then `gc.disable()`), as sleap-io's own tests do. sleap-io
+  takes care of this for its own network threads, so a server in another process
+  isn't affected.
 
 !!! note "See also"
     - [`load_slp`][sleap_io.load_slp]: Full URL keyword-argument reference

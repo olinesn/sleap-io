@@ -12,26 +12,35 @@ live-internet test is marked ``@pytest.mark.live``.
 
 import asyncio
 import copy
+import gc
 import os
+import subprocess
+import sys
+import threading
 import time
 import traceback
 import urllib.parse
 import warnings
+import weakref
 from pathlib import Path
 
 import aiohttp
+import h5py
 import pytest
 from aiohttp.client_reqrep import ConnectionKey
+from fsspec.asyn import get_loop
 from fsspec.implementations.cached import (
     SimpleCacheFileSystem,
     WholeFileCacheFileSystem,
 )
 from fsspec.implementations.http import HTTPFileSystem
+from h5py._objects import phil
 from multidict import CIMultiDict
 from pytest_httpserver import HTTPServer
 from werkzeug.wrappers import Response
 from yarl import URL
 
+from sleap_io.io import _remote
 from sleap_io.io._gdrive import (
     _filename_from_disposition,
     _is_gdrive_url,
@@ -49,6 +58,7 @@ from sleap_io.io._remote import (
     _display_filename,
     _filename_from_url,
     _find_response_error,
+    _guard_collection_on_read_threads,
     _head_or_range_probe,
     _http_inner_options,
     _identify_magic,
@@ -2835,3 +2845,290 @@ def test_download_gdrive_no_filename_error_hides_api_key(gdrive_uc_template, tmp
     with pytest.raises(ValueError, match="determine a destination filename") as ei:
         download("https://drive.google.com/uc?id=FILEID&key=TOPSECRET", tmp_path)
     assert "TOPSECRET" not in str(ei.value)
+
+
+# ---------------------------------------------------------------------------
+# The garbage collector and the threads a read waits on
+# ---------------------------------------------------------------------------
+
+#: Seconds to wait for a collection before calling it stuck. Nothing it waits for is
+#: slow, so this is only there for a machine that's very busy.
+_COLLECTION_LIMIT = 60
+
+#: Reads from a server that won't answer until a collection has run on fsspec's thread,
+#: with an h5py object in a reference cycle for it to free. In its own process, because
+#: if this hangs, h5py's lock stays taken for good. If it's stuck when the limit runs
+#: out, it exits with its stacks.
+_COLLECTION_DURING_A_READ = """
+import faulthandler
+import gc
+import re
+import sys
+import threading
+import weakref
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
+
+import h5py
+from fsspec.asyn import get_loop
+
+from sleap_io import load_slp
+from sleap_io.io import _remote
+
+slp, garbage_path, what, limit = sys.argv[1:]
+body = Path(slp).read_bytes()
+armed, asked, collected = threading.Event(), threading.Event(), threading.Event()
+ranges_seen = []
+# A frame's read comes after a check that its dataset exists, which reads a file too.
+range_to_hold = {"labels": 1, "frame": 2}[what]
+
+
+class Handler(BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, *args):
+        pass
+
+    def do_HEAD(self):
+        self.send_response(200)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+
+    def do_GET(self):
+        asked_for = re.fullmatch(r"bytes=(\\d+)-(\\d+)", self.headers.get("Range", ""))
+        if asked_for is None:  # How fsspec asks whether a URL exists.
+            self.send_response(200)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+            return
+        # h5py reads the file in ranges, holding its lock until this is answered.
+        if armed.is_set():
+            ranges_seen.append(asked_for)
+            if len(ranges_seen) == range_to_hold:
+                asked.set()
+                collected.wait()
+        start, end = int(asked_for[1]), min(int(asked_for[2]), len(body) - 1)
+        self.send_response(206)
+        self.send_header("Accept-Ranges", "bytes")
+        self.send_header("Content-Length", str(end - start + 1))
+        self.send_header("Content-Range", f"bytes {start}-{end}/{len(body)}")
+        self.end_headers()
+        self.wfile.write(body[start : end + 1])
+
+
+def collect_on_network_thread():
+    def collect():
+        gc.collect()
+        collected.set()
+
+    asked.wait()
+    get_loop().call_soon_threadsafe(collect)
+
+
+# Reading only local files never touches the collector.
+load_slp(slp, open_videos=False)
+assert _remote._collection_guard is None
+
+server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+threading.Thread(target=server.serve_forever, daemon=True).start()
+threading.Thread(target=collect_on_network_thread, daemon=True).start()
+url = f"http://127.0.0.1:{server.server_address[1]}/labels.pkg.slp"
+
+faulthandler.dump_traceback_later(int(limit), exit=True)
+if what == "frame":
+    # Through a video's own file, opened when the frame is read.
+    video = load_slp(url).video
+    video.close()
+
+gc.collect()
+gc.disable()
+holder = {"file": h5py.File(garbage_path, "r")}
+holder["self"] = holder
+garbage = weakref.ref(holder["file"].id)
+del holder
+
+armed.set()
+if what == "frame":
+    assert video[0].shape == (384, 384, 1)
+    video.close()
+else:
+    assert len(load_slp(url, open_videos=False)) == 1
+assert collected.is_set()
+
+# It wasn't freed there, and it's still garbage for a collection anywhere else.
+assert garbage() is not None
+assert gc.collect() > 0
+assert garbage() is None
+faulthandler.cancel_dump_traceback_later()
+print("finished")
+"""
+
+
+@pytest.fixture
+def collector_off():
+    """Stop collections starting by themselves, which `gc.collect` isn't affected by."""
+    gc.collect()
+    gc.disable()
+    try:
+        yield
+    finally:
+        gc.enable()
+
+
+def _h5py_garbage(tmp_path: Path) -> weakref.ref:
+    """Leave an h5py object in a reference cycle, for a collection to free.
+
+    Args:
+        tmp_path: Where to put the file it's opened on.
+
+    Returns:
+        A weak reference to the object.
+    """
+    path = tmp_path / "garbage.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("x", data=[1, 2, 3])
+    holder = {"file": h5py.File(path, "r")}
+    holder["self"] = holder
+    return weakref.ref(holder["file"].id)
+
+
+@pytest.mark.parametrize("what", ["labels", "frame"])
+def test_collection_on_network_thread_during_a_read_doesnt_hang(
+    tmp_path, slp_minimal_pkg, what
+):
+    """A read carries on when a collection on fsspec's thread finds an h5py object.
+
+    h5py holds its global lock during the read, and the read waits for that thread. If
+    the collection frees the object, it wants the lock, and neither can go on.
+    """
+    path = tmp_path / "garbage.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("x", data=[1, 2, 3])
+    # The outer limit is for getting as far as the inner one: imports can take minutes
+    # on a machine that's very busy.
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            _COLLECTION_DURING_A_READ,
+            slp_minimal_pkg,
+            str(path),
+            what,
+            str(_COLLECTION_LIMIT),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    assert result.returncode == 0, result.stderr[-6000:]
+    assert "finished" in result.stdout
+
+
+@pytest.mark.parametrize("where", ["network thread", "its worker thread"])
+def test_collection_on_read_thread_doesnt_want_h5py_lock(
+    tmp_path, collector_off, where
+):
+    """A collection on a thread a read waits on leaves h5py objects for later.
+
+    The workers of fsspec's loop count: DNS lookups and a cloud client's blocking calls
+    run there. A worker that's stuck is let go by this thread leaving the lock.
+    """
+    _guard_collection_on_read_threads()
+    garbage = _h5py_garbage(tmp_path)
+
+    def collect_once_listed():
+        # A worker can start its first job a moment before its pool lists it.
+        pool = get_loop()._default_executor
+        while threading.current_thread() not in pool._threads:
+            time.sleep(0.001)
+        return gc.collect()
+
+    async def collect():
+        if where == "network thread":
+            return gc.collect()
+        return await asyncio.to_thread(collect_once_listed)
+
+    with phil:
+        future = asyncio.run_coroutine_threadsafe(collect(), get_loop())
+        found = future.result(_COLLECTION_LIMIT)
+
+    assert found == 0
+    assert garbage() is not None
+    assert gc.get_freeze_count() == 0
+    assert gc.collect() > 0
+    assert garbage() is None
+
+
+def test_collection_on_other_threads_still_frees_h5py_objects(tmp_path, collector_off):
+    """Only the threads a read waits on are held back."""
+    _guard_collection_on_read_threads()
+    garbage = _h5py_garbage(tmp_path)
+
+    thread = threading.Thread(target=gc.collect)
+    thread.start()
+    thread.join(_COLLECTION_LIMIT)
+
+    assert not thread.is_alive()
+    assert garbage() is None
+
+
+def test_collection_elsewhere_keeps_what_the_program_froze(collector_off):
+    """Objects a program froze stay frozen when no collection needed holding back."""
+    _guard_collection_on_read_threads()
+    gc.freeze()
+    try:
+        gc.collect()
+        assert gc.get_freeze_count() > 0
+    finally:
+        gc.unfreeze()
+
+
+def test_open_url_guards_collection_once_for_a_stream(httpserver):
+    """Opening a URL for streaming installs one guard, however many it opens."""
+    httpserver.expect_request("/data.bin").respond_with_handler(
+        _make_range_handler(_HDF5_BODY)
+    )
+    url = httpserver.url_for("/data.bin")
+
+    open_url(url, retries=0).close()
+    installed = list(gc.callbacks)
+    open_url(url, retries=0).close()
+
+    assert _remote._collection_guard in installed
+    assert gc.callbacks == installed
+
+
+@pytest.mark.parametrize("mode", ["cache", "filecache", "download"])
+def test_other_stream_modes_read_without_network_thread(httpserver, tmp_path, mode):
+    """Only `blockcache` reads wait on fsspec's thread, so only it needs the guard.
+
+    h5py reads these with that thread tied up. A read that needed it would wait until
+    its wait ran out.
+    """
+    path = tmp_path / "data.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("x", data=[1, 2, 3])
+    httpserver.expect_request("/data.h5").respond_with_handler(
+        _make_range_handler(path.read_bytes())
+    )
+    file = open_url(
+        httpserver.url_for("/data.h5"),
+        stream_mode=mode,
+        cache_storage=tmp_path / "cache",
+    )
+    tied_up, released = threading.Event(), threading.Event()
+
+    async def tie_up_network_thread():
+        tied_up.set()
+        return released.wait(_COLLECTION_LIMIT)
+
+    future = asyncio.run_coroutine_threadsafe(tie_up_network_thread(), get_loop())
+    assert tied_up.wait(_COLLECTION_LIMIT)
+    with h5py.File(file, "r") as f:
+        assert f["x"][1] == 2
+    released.set()
+    file.close()
+
+    assert future.result(_COLLECTION_LIMIT)

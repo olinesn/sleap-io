@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import gc
 import importlib
 import io
 import os
@@ -24,10 +25,11 @@ import pathlib
 import posixpath
 import re
 import tempfile
+import threading
 import time
 import urllib.parse
 import warnings
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from typing import Any
 
 # ---------------------------------------------------------------------------
@@ -613,6 +615,78 @@ def _http_inner_options(headers: dict[str, str] | None) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
+# The garbage collector and the threads a read waits on
+# ---------------------------------------------------------------------------
+
+#: The ``gc.callbacks`` entry, once a URL has been opened for streaming.
+_collection_guard: Callable[[str, dict], None] | None = None
+
+
+def _make_collection_guard() -> Callable[[str, dict], None]:
+    """Build the ``gc.callbacks`` entry for :func:`_guard_collection_on_read_threads`.
+
+    Returns:
+        A callback for ``gc.callbacks``. It holds on to everything it uses, because a
+        collection can start during interpreter shutdown, after module globals are gone.
+    """
+    from fsspec.asyn import iothread, loop
+
+    get_ident, freeze, unfreeze = threading.get_ident, gc.freeze, gc.unfreeze
+    frozen = False
+
+    def guard(phase: str, info: dict) -> None:
+        nonlocal frozen
+        if phase == "start":
+            # `_default_executor` runs DNS lookups and a cloud client's blocking calls.
+            # If asyncio ever renames these, only those threads lose this protection.
+            pool = getattr(loop[0], "_default_executor", None)
+            threads = (iothread[0], *getattr(pool, "_threads", ()))
+            me = get_ident()
+            if any(thread is not None and thread.ident == me for thread in threads):
+                frozen = True
+                freeze()
+        elif frozen:
+            frozen = False
+            unfreeze()
+
+    return guard
+
+
+def _guard_collection_on_read_threads() -> None:
+    """Stop the garbage collector doing anything on the threads a remote read waits on.
+
+    h5py holds its global lock while it reads a file object, and a remote file object
+    waits for fsspec's thread. A collection starts on whichever thread allocates, so it
+    can start on that one, and if it frees an h5py object, which can be any h5py object
+    the program left in a reference cycle, it wants that lock. Neither can go on, and
+    nothing ever times out.
+
+    A callback can't cancel a collection, but it can leave it nothing to look at, so a
+    collection starting on one of those threads freezes everything until it stops. Its
+    garbage waits for the next full collection, since unfreezing puts everything in the
+    oldest generation, including anything the program froze itself. That's rare: those
+    threads allocate little, so few collections start there.
+
+    Keeping the collector off during reads wouldn't do. h5py takes its lock before the
+    first read of a call and keeps it between reads, so a collection can already be
+    running on fsspec's thread by the time a read starts, and ``gc.collect`` ignores
+    ``gc.disable``. It would also leave the rest of the program's garbage piling up for
+    as long as a slow read takes.
+
+    Other threads are left alone. One that wants the lock during a read waits for that
+    read and carries on, unless the read depends on it, as it does on a test server in
+    the same process (see ``tests/conftest.py``).
+    """
+    # No lock: two threads getting here at once can install it twice, which does no
+    # harm, while a lock held across a fork would hang the child's first open.
+    global _collection_guard
+    if _collection_guard is None:
+        _collection_guard = _make_collection_guard()
+    if _collection_guard not in gc.callbacks:
+        gc.callbacks.append(_collection_guard)
+
+
+# ---------------------------------------------------------------------------
 # Open a URL
 # ---------------------------------------------------------------------------
 
@@ -758,6 +832,8 @@ def open_url(
         )
 
     if stream_mode == "blockcache":
+        # The other modes have the whole file by the time h5py reads it.
+        _guard_collection_on_read_threads()
 
         def _open():
             return fs.open(
