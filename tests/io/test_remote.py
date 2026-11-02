@@ -383,6 +383,7 @@ def test_mask_url_credentials_masks_only_the_credential(value, masked):
         "gs://bucket/a b.mp4",
         "s3://bucket/run@2/v=1/a.mp4",
         "https://host:notaport/v.mp4",
+        "https://host:notaport/v.mp4?x=1",
         "/Users/me/a b#1?%.mp4",
         "/Users/me@corp/run=1/v.mp4",
         "C:\\Users\\me\\b.mp4",
@@ -420,7 +421,7 @@ def test_mask_url_credentials_covers_every_listed_param(name):
 
 def test_mask_url_credentials_takes_a_path():
     """A filename can be a `Path`."""
-    assert _mask_url_credentials(Path("a/v.mp4")) == Path("a/v.mp4").as_posix()
+    assert _mask_url_credentials(Path("a/v.mp4")) == os.fspath(Path("a/v.mp4"))
     assert _mask_url_credentials(Path("v.mp4?token=SECRET")) == "v.mp4?token=***"
 
 

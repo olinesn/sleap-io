@@ -1,5 +1,7 @@
 """Tests for functions in the sleap_io.io.jabs file."""
 
+import sys
+
 import h5py
 import numpy as np
 import pytest
@@ -208,6 +210,9 @@ def test_roi_to_static_object_coords_unsupported_geometry():
     assert result is None
 
 
+@pytest.mark.skipif(
+    sys.platform == "win32", reason="A folder on Windows can't be named after a URL."
+)
 @pytest.mark.parametrize(
     "url, name",
     [
