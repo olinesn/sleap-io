@@ -11,6 +11,7 @@ live-internet test is marked ``@pytest.mark.live``.
 """
 
 import asyncio
+import copy
 import os
 import time
 import traceback
@@ -45,6 +46,7 @@ from sleap_io.io._remote import (
     _SENSITIVE_QUERY_PARAMS,
     RemoteIOError,
     _build_fsspec_filesystem,
+    _display_filename,
     _filename_from_url,
     _find_response_error,
     _head_or_range_probe,
@@ -57,6 +59,8 @@ from sleap_io.io._remote import (
     _redact_url,
     _redacted_cause_summary,
     _redirect_target,
+    _remote_errors,
+    _RemoteFile,
     _require_package,
     _resolve_target_path,
     _retry_after_seconds,
@@ -166,6 +170,22 @@ def test_is_url_pathlike():
     """os.PathLike inputs are handled and treated as local paths."""
     assert _is_url(Path("C:/Users/foo.slp")) is False
     assert _is_url(Path("labels.slp")) is False
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://user:SECRET@[bad/labels.slp?token=SECRET",
+        "https://user:SECRET\u2100@host/labels.slp",
+    ],
+    ids=["brackets", "refused-character"],
+)
+def test_is_url_malformed_hides_credentials(url):
+    """The refusal from urlparse can quote the netloc, so it's replaced."""
+    with pytest.raises(ValueError, match="Malformed URL") as ei:
+        _is_url(url)
+    shown = "".join(traceback.format_exception(ei.value))
+    assert "SECRET" not in shown
 
 
 def test_is_url_non_string_non_pathlike():
@@ -351,6 +371,48 @@ def test_redact_url_ordinary_fragment_unchanged():
     assert _redact_url(url) == url
 
 
+def test_redact_url_password_holding_at_sign():
+    """The whole password is hidden when it holds an ``@``: the last one ends it."""
+    out = _redact_url("https://user:pa@ss@host.example/labels.slp?a=1")
+    assert out == "https://***:***@host.example/labels.slp?a=1"
+
+
+def test_redact_url_unparsable_still_masked():
+    """A URL urlparse refuses still has its userinfo and listed params masked."""
+    out = _redact_url("https://user:s3cr3t@[bad/labels.slp?token=SECRET&a=1")
+    assert out == "https://***:***@[bad/labels.slp?token=***&a=1"
+
+
+@pytest.mark.parametrize(
+    "filename",
+    [
+        "labels.slp",
+        "/data/run?key=1/video.mp4",
+        "C:\\data\\video.mp4",
+        Path("data/video.mp4"),
+        None,
+    ],
+)
+def test_display_filename_leaves_anything_but_a_url_alone(filename):
+    """What's shown for a local file doesn't change."""
+    assert _display_filename(filename) is filename
+
+
+def test_display_filename_redacts_urls():
+    """A URL is redacted, alone or in a list, and a ``Path`` can't hide one."""
+    url = "https://host/v.mp4?X-Amz-Signature=SECRET&keep=ok"
+    shown = "https://host/v.mp4?X-Amz-Signature=%2A%2A%2A&keep=ok"
+    assert _display_filename(url) == shown
+    assert _display_filename([url, "local.png"]) == [shown, "local.png"]
+    assert "SECRET" not in _display_filename(Path(url))
+
+
+def test_display_filename_unparsable_url():
+    """A malformed URL neither raises nor shows its credentials."""
+    shown = _display_filename("https://[bad/v.mp4?token=SECRET")
+    assert shown == "https://[bad/v.mp4?token=***"
+
+
 # ---------------------------------------------------------------------------
 # _identify_magic
 # ---------------------------------------------------------------------------
@@ -505,6 +567,80 @@ def test_redacted_cause_summary_keeps_what_only_looks_like_a_listed_param(messag
 def test_redacted_cause_summary_empty_message():
     """An exception with no message degrades to just its type name."""
     assert _redacted_cause_summary(ValueError()) == "ValueError"
+
+
+# ---------------------------------------------------------------------------
+# _remote_errors
+# ---------------------------------------------------------------------------
+
+_SECRET_URL = "https://host/v.mp4?token=TOPSECRET&keep=ok"
+
+
+def test_remote_errors_local_file_passes_through():
+    """A local file's errors come through as they are, even ones naming a URL."""
+    with pytest.raises(OSError, match=_SECRET_URL.split("?")[0]) as ei:
+        with _remote_errors("/data/video.mp4"):
+            raise OSError(f"can't open {_SECRET_URL}")
+    assert not isinstance(ei.value, RemoteIOError)
+
+
+def test_remote_errors_converts_an_os_error_on_a_url():
+    """An ``OSError`` on a URL becomes a ``RemoteIOError``, with the fallback name."""
+    with pytest.raises(RemoteIOError, match="could not read") as ei:
+        with _remote_errors(_SECRET_URL, fallback="could not read"):
+            raise OSError(f"can't open {_SECRET_URL}")
+    assert ei.value.url == "https://host/v.mp4?token=%2A%2A%2A&keep=ok"
+    assert "TOPSECRET" not in _everything_shown(ei.value)
+
+
+def test_remote_errors_converts_anything_quoting_a_url():
+    """Any error type is converted if its message would show the URL."""
+    with pytest.raises(RemoteIOError) as ei:
+        with _remote_errors(_SECRET_URL):
+            raise ValueError(f"bad data in {_SECRET_URL}")
+    assert "TOPSECRET" not in _everything_shown(ei.value)
+
+
+def test_remote_errors_converts_a_chain_quoting_a_url():
+    """A clean message doesn't help if an exception in its chain shows the URL."""
+    with pytest.raises(RemoteIOError) as ei:
+        with _remote_errors(_SECRET_URL):
+            try:
+                raise ValueError(f"bad data in {_SECRET_URL}")
+            except ValueError as inner:
+                raise KeyError("clean") from inner
+    assert "TOPSECRET" not in _everything_shown(ei.value)
+
+
+def test_remote_errors_keeps_errors_with_nothing_to_hide():
+    """A frame out of range stays an ``IndexError``, even on a URL."""
+    with pytest.raises(IndexError, match="out of range"):
+        with _remote_errors(_SECRET_URL):
+            raise IndexError("Frame index 5 out of range.")
+
+
+def test_remote_errors_list_of_urls():
+    """An image sequence of URLs is treated as remote."""
+    with pytest.raises(RemoteIOError) as ei:
+        with _remote_errors([_SECRET_URL, "https://host/b.png"]):
+            raise OSError(f"can't open {_SECRET_URL}")
+    assert "TOPSECRET" not in _everything_shown(ei.value)
+
+
+@pytest.mark.parametrize(
+    "error,match",
+    [
+        (OSError("Connection reset by peer"), "could not read"),
+        (aiohttp.ClientPayloadError("Payload is not completed"), "truncated body"),
+        (asyncio.TimeoutError(), "timeout"),
+    ],
+    ids=["os-error", "payload-error", "timeout"],
+)
+def test_remote_errors_converts_network_failures_quoting_nothing(error, match):
+    """A network failure on a URL is converted even if its message names no URL."""
+    with pytest.raises(RemoteIOError, match=match):
+        with _remote_errors(_SECRET_URL, fallback="could not read"):
+            raise error
 
 
 # ---------------------------------------------------------------------------
@@ -1201,6 +1337,100 @@ def test_refused_url_typed_with_quote_and_space_shows_no_credential(httpserver):
     assert "mouse's data" in shown
     assert "TOPSECRET" not in shown
     assert "=KEY" not in shown
+
+
+def _serve_until(httpserver, path, body, limit, status=403):
+    """Serve ``body`` with Range support, refusing ranges starting at or past ``limit``.
+
+    Like a signed link that expires partway through a load, or a server that starts
+    failing: the open succeeds, and a later read doesn't.
+
+    Args:
+        httpserver: The loopback test server.
+        path: The path to serve at.
+        body: The bytes to serve.
+        limit: The first offset that's refused.
+        status: The HTTP status to refuse with.
+    """
+    serve = _make_range_handler(body)
+
+    def _handler(request):
+        rng = request.headers.get("Range", "")
+        if rng.startswith("bytes=") and int(rng[6:].split("-")[0]) >= limit:
+            return Response(b"denied", status=status)
+        return serve(request)
+
+    httpserver.expect_request(path).respond_with_handler(_handler)
+
+
+@pytest.mark.parametrize("query,credentials", _SIGNED_QUERIES)
+def test_later_read_failure_shows_no_credential(httpserver, query, credentials):
+    """A block that fails after the open is a ``RemoteIOError``, like a failed open."""
+    body = b"x" * 4096
+    _serve_until(httpserver, "/labels.slp", body, limit=1024)
+    url = httpserver.url_for("/labels.slp") + f"?{query}"
+
+    file = open_url(url, block_size=1024, retries=0)
+    assert file.read(16) == body[:16]
+    file.seek(2048)
+    with pytest.raises(RemoteIOError) as read:
+        file.read(16)
+    file.seek(2048)
+    with pytest.raises(RemoteIOError) as readinto:
+        file.readinto(bytearray(16))
+
+    for e in (read.value, readinto.value):
+        assert e.status == 403
+        shown = _everything_shown(e)
+        for credential in credentials:
+            assert credential not in shown
+
+
+def test_remote_file_keeps_errors_with_nothing_to_hide(httpserver):
+    """A read of a closed file is still a ``ValueError``, not a network failure."""
+    _serve_until(httpserver, "/labels.slp", b"x" * 4096, limit=4096)
+    file = open_url(httpserver.url_for("/labels.slp"), retries=0)
+    file.close()
+    with pytest.raises(ValueError, match="closed"):
+        file.read(1)
+
+
+def test_remote_file_repr_shows_no_credential(httpserver):
+    """h5py takes a file object's ``repr`` as its name, so that's masked too."""
+    _serve_until(httpserver, "/labels.slp", b"x" * 4096, limit=4096)
+    url = httpserver.url_for("/labels.slp") + "?token=TOPSECRET"
+    assert "TOPSECRET" not in repr(open_url(url, retries=0))
+
+
+def test_remote_file_behaves_like_the_file_it_wraps(httpserver):
+    """Everything else passes through, including ``with`` and ``copy``."""
+    body = b"0123456789" * 100
+    _serve_until(httpserver, "/labels.slp", body, limit=len(body))
+    url = httpserver.url_for("/labels.slp")
+
+    with open_url(url, retries=0) as file:
+        assert isinstance(file, _RemoteFile)
+        assert file.read(4) == b"0123"
+        assert file.tell() == 4
+        assert file.size == len(body)
+        assert hasattr(file, "readinto")
+        assert not hasattr(file, "no_such_attribute")
+        assert copy.copy(file).tell() == 4
+    assert file.closed
+
+
+@pytest.mark.parametrize("stream_mode", ["download", "cache", "filecache"])
+def test_only_streaming_files_are_wrapped(httpserver, tmp_path, stream_mode):
+    """The other modes have the whole file by the time they return."""
+    _serve_until(httpserver, "/labels.slp", b"x" * 4096, limit=4096)
+    file = open_url(
+        httpserver.url_for("/labels.slp"),
+        stream_mode=stream_mode,
+        cache_storage=tmp_path,
+        retries=0,
+    )
+    assert not isinstance(file, _RemoteFile)
+    file.close()
 
 
 # ---------------------------------------------------------------------------

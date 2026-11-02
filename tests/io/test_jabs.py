@@ -39,6 +39,20 @@ def test_label_conversions(jabs_real_data_v5):
         convert_labels(slp_labels, slp_labels.videos[0])
 
 
+def test_convert_labels_unassigned_track_warning_hides_url_credentials(
+    jabs_real_data_v5,
+):
+    """The unassigned-track warning names a URL without its credentials."""
+    slp_labels = read_labels(jabs_real_data_v5)
+    video = slp_labels.videos[0]
+    video.filename = "https://host/v.mp4?token=SECRET"
+    slp_labels.find(video)[0].instances[0].track = None
+
+    with pytest.warns(UserWarning, match="Pose with unassigned track") as record:
+        convert_labels(slp_labels, video)
+    assert not any("SECRET" in str(w.message) for w in record)
+
+
 def test_tracklets_to_v3(jabs_real_data_v5):
     """Test `tracklets_to_v3` meets v3 criteria.
 

@@ -11,6 +11,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from sleap_io.io._remote import _display_filename
 from sleap_io.model.instance import Instance, PredictedInstance, Track
 from sleap_io.model.labeled_frame import LabeledFrame
 from sleap_io.model.labels import Labels
@@ -395,7 +396,8 @@ def to_analysis_arrays(
     # Get labeled frames for this video.
     lfs = labels.find(video)
     if not lfs:
-        raise ValueError(f"No labeled frames in video: {video.filename}")
+        shown = _display_filename(video.filename)
+        raise ValueError(f"No labeled frames in video: {shown}")
 
     frame_idxs = sorted(lf.frame_idx for lf in lfs)
     first_frame = 0 if all_frames else frame_idxs[0]

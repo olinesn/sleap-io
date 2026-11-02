@@ -90,6 +90,7 @@ import numpy as np
 import simplejson as json
 from tqdm import tqdm
 
+from sleap_io.io._remote import _display_filename
 from sleap_io.io.skeleton import SkeletonSLPDecoder, SkeletonSLPEncoder
 from sleap_io.io.utils import (
     _read_dataset_from_open_file,
@@ -172,8 +173,9 @@ def _check_format_id(labels_path: str, f: h5py.File) -> None:
         return
     format_id = float(f["metadata"].attrs["format_id"])
     if format_id >= SLP_FORMAT_ID_LIMIT:
+        shown = _display_filename(labels_path)
         raise ValueError(
-            f"{labels_path} uses SLP format {format_id:g}, which is newer than this "
+            f"{shown} uses SLP format {format_id:g}, which is newer than this "
             f"version of sleap-io supports (max {int(SLP_FORMAT_ID_LIMIT) - 1}.x); "
             "upgrade sleap-io to read it."
         )
@@ -1252,9 +1254,10 @@ def process_and_embed_frames(
             # Surface which video the missing frame belongs to. The bare backend
             # error only reports the frame index, which is not actionable when a
             # project has more than one video.
+            shown = _display_filename(video.filename)
             raise IndexError(
                 f"Frame index {frame_idx} out of range for video "
-                f"{frame_meta['video_ind']} ({video.filename}), which has "
+                f"{frame_meta['video_ind']} ({shown}), which has "
                 f"{len(video)} frames."
             ) from e
 
@@ -3578,8 +3581,9 @@ def read_metadata(labels_path: str, *, _hdf5_file: h5py.File | None = None) -> d
     try:
         md = read_hdf5_attrs(labels_path, "metadata", "json", _hdf5_file=_hdf5_file)
     except KeyError as e:
+        shown = _display_filename(labels_path)
         raise ValueError(
-            f"The SLEAP labels file {labels_path!r} is missing its required "
+            f"The SLEAP labels file {shown!r} is missing its required "
             "metadata JSON blob (the 'metadata' HDF5 group has no readable 'json' "
             "attribute) and is likely corrupt. If you have a working .slp file "
             "with the same skeleton, you can copy the attribute into a BACKUP "

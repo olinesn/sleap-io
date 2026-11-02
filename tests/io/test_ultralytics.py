@@ -21,7 +21,9 @@ from sleap_io import (
 )
 from sleap_io.io.main import load_file, load_ultralytics, save_file, save_ultralytics
 from sleap_io.io.ultralytics import (
+    _build_class_names_from_bboxes,
     _build_class_names_from_rois,
+    _write_bbox_labels,
     _write_roi_labels,
     create_skeleton_from_config,
     denormalize_coordinates,
@@ -1545,6 +1547,61 @@ def test_write_bbox_label_file(tmp_path):
     assert bboxes_read[1].score == pytest.approx(0.9, abs=1e-4)
     assert abs(bboxes_read[1].x_center - 50.0) < 1e-3
     assert abs(bboxes_read[1].y_center - 25.0) < 1e-3
+
+
+def test_save_frame_image_warning_hides_url_credentials(tmp_path):
+    """The failed-frame warning names a URL without its credentials."""
+    from sleap_io.io.ultralytics import _save_frame_image
+
+    frame_data = {
+        "video_path": "http://127.0.0.1:9/v.mp4?token=SECRET",
+        "frame_idx": 0,
+        "output_path": str(tmp_path / "frame.png"),
+    }
+    with pytest.warns(UserWarning, match="Error processing frame") as record:
+        assert _save_frame_image((frame_data, "png", None)) is None
+    assert not any("SECRET" in str(w.message) for w in record)
+
+
+def test_write_roi_labels_warning_hides_url_credentials(tmp_path):
+    """The can't-read warning for ROIs names a URL without its credentials."""
+    url = "http://127.0.0.1:9/v.mp4?token=SECRET"
+    video = Video(filename=url, open_backend=False)
+    roi = UserROI.from_bbox(5, 5, 20, 20, category="obj", video=video)
+    lf = LabeledFrame(video=video, frame_idx=0)
+    lf.rois.append(roi)
+
+    with pytest.warns(UserWarning, match="Error processing") as record:
+        _write_roi_labels(
+            Labels(labeled_frames=[lf]),
+            tmp_path / "dataset",
+            split_ratios={"train": 1.0},
+            class_names=_build_class_names_from_rois([roi]),
+            image_format="png",
+            image_quality=None,
+            verbose=False,
+        )
+    assert not any("SECRET" in str(w.message) for w in record)
+
+
+def test_write_bbox_labels_warning_hides_url_credentials(tmp_path):
+    """The can't-read warning for boxes names a URL without its credentials."""
+    url = "http://127.0.0.1:9/v.mp4?token=SECRET"
+    video = Video(filename=url, open_backend=False)
+    bbox = UserBoundingBox.from_xywh(5, 5, 20, 20, category="obj")
+    lf = LabeledFrame(video=video, frame_idx=0, bboxes=[bbox])
+
+    with pytest.warns(UserWarning, match="Error processing") as record:
+        _write_bbox_labels(
+            Labels(labeled_frames=[lf]),
+            tmp_path / "dataset",
+            split_ratios={"train": 1.0},
+            class_names=_build_class_names_from_bboxes([bbox]),
+            image_format="png",
+            image_quality=None,
+            verbose=False,
+        )
+    assert not any("SECRET" in str(w.message) for w in record)
 
 
 def test_write_roi_labels_splitting(tmp_path):

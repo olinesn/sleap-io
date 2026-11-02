@@ -389,10 +389,19 @@ except sio.RemoteIOError as e:
     print(e.url)     # redacted URL (tokens/userinfo stripped)
 ```
 
-A signed URL's expiry and signing details (`X-Amz-Expires`, `X-Goog-Date`, `se`,
-...) stay visible, because they often say why it failed. A query parameter that
-only happens to be called `key` is hidden in messages too (`key=%2A%2A%2A`); the
-request itself still carries its value.
+A read that fails after the file has opened, such as a signed link expiring partway
+through a load, raises `RemoteIOError` too, and so does a remote video that can't be
+decoded. Asking for a frame that isn't there is still an `IndexError`.
+
+Printing a `Video`, and everything the `sio` command line shows (its `--json` output
+included), masks a URL the same way. A signed URL's expiry and signing details
+(`X-Amz-Expires`, `X-Goog-Date`, `se`, ...) stay visible, because they often say why
+it failed. A query parameter that only happens to be called `key` is hidden in
+messages too (`key=%2A%2A%2A`); the request itself still carries its value.
+
+The URL itself stays whole in memory, in `video.filename` and
+`labels.provenance["filename"]`, because that's what gets reopened. Printing those
+values yourself shows the credentials.
 
 Only transient statuses (`429`, `500`, `502`, `503`, `504`) are retried (with
 exponential backoff, honoring an integer `Retry-After`); the retry count is

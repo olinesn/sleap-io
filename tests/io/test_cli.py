@@ -32,6 +32,7 @@ from sleap_io.io.cli import (
     _load_overlay,
     _parse_cli_headers,
     _parse_overlay_outline_color,
+    _print_video_details,
     _RemoteInputPath,
     _run_subprocess_with_progress,
     cli,
@@ -531,6 +532,314 @@ def test_fix_url_input_dry_run_redacts_credentials():
     assert "supersecret" not in out
     assert "AttributeError" not in out
     assert "Traceback" not in out
+
+
+def test_remote_input_path_format_masks_credentials():
+    """An f-string shows a URL input masked; `str` keeps it whole for the loaders."""
+    url = "https://host/a/b/data.slp?token=secret&keep=ok"
+    p = _RemoteInputPath(url)
+    assert f"{p}" == "https://host/a/b/data.slp?token=%2A%2A%2A&keep=ok"
+    assert "secret" not in f"{p:>80}"
+    assert "secret" not in f"{p.parent}"
+    assert "secret" not in f"{p.with_suffix('.nwb')}"
+    assert str(p) == url
+    assert os.fspath(p) == url
+
+
+def _without_wrapping(text: str) -> str:
+    """Remove what rich's wrapping and panels put inside a long line of output."""
+    return re.sub(r"[\s│╭╮╰╯─]+", "", _strip_ansi(text))
+
+
+def _serve_with_ranges(httpserver, path, data):
+    """Serve `data` with the HEAD and Range support a remote `.slp` needs."""
+
+    def handler(request):
+        total = len(data)
+        ranges = {"Accept-Ranges": "bytes"}
+        if request.method == "HEAD":
+            resp = Response(b"", headers=ranges)
+            resp.headers["Content-Length"] = str(total)
+            return resp
+        if "Range" not in request.headers:
+            return Response(data, headers=ranges)
+        start_s, _, end_s = request.headers["Range"].split("=", 1)[1].partition("-")
+        start = int(start_s)
+        end = min(int(end_s) if end_s else total - 1, total - 1)
+        ranges["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return Response(data[start : end + 1], status=206, headers=ranges)
+
+    httpserver.expect_request(path).respond_with_handler(handler)
+
+
+#: A signed URL's query, long enough that a table shortening its end can't keep a name.
+_SIGNED_QUERY = (
+    "X-Amz-Credential=AKIAEXAMPLE&X-Amz-Expires=3600&X-Amz-Signature=" + "5c0f3e7a" * 16
+)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["show", "{url}"],
+        ["show", "{url}", "--video"],
+        ["show", "{url}", "--provenance"],
+        ["show", "{url}", "--json"],
+        ["show", "{url}", "--lf", "0"],
+        ["show", "{url}", "--lf", "0", "--json"],
+        ["filenames", "{url}"],
+        ["filenames", "{url}", "--json"],
+        ["convert", "{url}", "-o", "{tmp}/out.slp"],
+        ["split", "{url}", "-o", "{tmp}/split"],
+        ["fix", "{url}", "--dry-run"],
+    ],
+    ids=lambda args: " ".join(a for a in args if "{" not in a),
+)
+def test_url_input_output_hides_credentials(httpserver, tmp_path, slp_minimal, args):
+    """Commands report a URL input masked, and the load still gets the whole URL."""
+    _serve_with_ranges(httpserver, "/labels.slp", Path(slp_minimal).read_bytes())
+    url = httpserver.url_for("/labels.slp") + f"?{_SIGNED_QUERY}"
+
+    result = CliRunner().invoke(cli, [a.format(url=url, tmp=tmp_path) for a in args])
+
+    assert result.exit_code == 0, result.output
+    out = _without_wrapping(result.output)
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.fixture
+def slp_holding_urls(tmp_path, slp_minimal):
+    """A local `.slp` whose video names and provenance are a signed URL.
+
+    Older saves wrote a video's URL as it was, credentials included.
+    """
+    # Nothing listens on this port, so checking whether the video exists is quick.
+    url = f"http://127.0.0.1:9/session/video.mp4?{_SIGNED_QUERY}"
+    labels = load_slp(slp_minimal, open_videos=False)
+    video = labels.videos[0]
+    video.replace_filename(url, open=False)
+    video.source_video = Video(
+        filename=url,
+        source_video=Video(filename=url, open_backend=False),
+        open_backend=False,
+    )
+    labels.provenance["filename"] = url
+    labels.provenance["nested"] = {"urls": [url]}
+    path = tmp_path / "holding_urls.slp"
+    save_slp(labels, str(path), embed=False)
+    return str(path)
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["show"],
+        ["show", "--video"],
+        ["show", "--provenance"],
+        ["show", "--json"],
+        ["show", "--lf", "0"],
+        ["show", "--lf", "0", "--json"],
+        ["filenames"],
+        ["filenames", "--all"],
+        ["filenames", "--source", "--original"],
+        ["filenames", "--json"],
+        ["fix", "--dry-run"],
+    ],
+    ids=" ".join,
+)
+def test_local_file_holding_urls_output_hides_credentials(slp_holding_urls, args):
+    """Names stored in a file are shown masked: its URL is no safer than a typed one."""
+    command, *flags = args
+    result = CliRunner().invoke(cli, [command, slp_holding_urls, *flags])
+
+    assert result.exit_code == 0, result.output
+    out = _without_wrapping(result.output)
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.mark.parametrize("shape", [None, (1, 384, 384, 1)], ids=["no-shape", "shape"])
+def test_show_video_table_shortens_a_url_after_masking_it(
+    slp_holding_urls, tmp_path, shape
+):
+    """The table keeps a long name's end, which for a URL is where a signature is."""
+    labels = load_slp(slp_holding_urls, open_videos=False)
+    labels.videos[0].backend_metadata["shape"] = shape
+    path = tmp_path / "table.slp"
+    save_slp(labels, str(path), embed=False)
+
+    result = CliRunner().invoke(cli, ["show", str(path)])
+
+    out = _without_wrapping(result.output)
+    assert "X-Amz-Signature=%2A%2A%2A" in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.mark.parametrize(
+    "args,expected",
+    [
+        (["trim", "--start", "0", "--end", "1", "-o", "{tmp}/t.slp"], "Video:"),
+        (["transform", "--scale", "0.5", "--dry-run", "-o", "{tmp}/tr.slp"], "Video0:"),
+    ],
+    ids=["trim", "transform"],
+)
+def test_commands_naming_a_stored_url_hide_credentials(
+    slp_holding_urls, tmp_path, args, expected
+):
+    """Commands that report which video they're on show its URL masked."""
+    labels = load_slp(slp_holding_urls, open_videos=False)
+    labels.videos[0].backend_metadata["shape"] = (10, 384, 384, 1)
+    path = tmp_path / "known_length.slp"
+    save_slp(labels, str(path), embed=False)
+
+    command, *rest = args
+    result = CliRunner().invoke(
+        cli, [command, str(path), *(a.format(tmp=tmp_path) for a in rest)]
+    )
+
+    out = _without_wrapping(result.output)
+    assert expected in out, result.output
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+def test_reencode_skipping_a_video_hides_credentials(tmp_path):
+    """The note about a video that can't be reencoded shows its URL masked."""
+    from sleap_io.io.cli import _reencode_video_object
+    from sleap_io.io.video_reading import ImageVideo
+
+    url = f"http://127.0.0.1:9/a.png?{_SIGNED_QUERY}"
+    video = Video(
+        filename=url, backend=ImageVideo([url], plugin="opencv"), open_backend=False
+    )
+
+    runner = CliRunner()
+    with runner.isolation() as streams:
+        result = _reencode_video_object(
+            video,
+            tmp_path / "out.mp4",
+            crf=25,
+            preset="superfast",
+            keyframe_interval=1.0,
+        )
+        output = streams[0].getvalue().decode()
+
+    assert result is None
+    out = _without_wrapping(output)
+    assert "cannotbereencoded" in out
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+def test_show_embedded_video_source_hides_credentials(slp_minimal_pkg):
+    """The source video named for an embedded video shows no credentials."""
+    url = f"http://127.0.0.1:9/session/video.mp4?{_SIGNED_QUERY}"
+    labels = load_slp(slp_minimal_pkg)
+    labels.videos[0].source_video = Video(filename=url, open_backend=False)
+
+    runner = CliRunner()
+    with runner.isolation() as streams:
+        _print_video_details(labels)
+        output = streams[0].getvalue().decode()
+
+    out = _without_wrapping(output)
+    assert "SourceVideo" in out
+    assert "video.mp4" in out
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.mark.parametrize(
+    "prefix,heading",
+    [
+        (("http://127.0.0.1:9/session", "http://127.0.0.1:9/moved"), "Replaced"),
+        (("/nowhere", "/elsewhere"), "Unchanged"),
+    ],
+    ids=["replaced", "unchanged"],
+)
+def test_filenames_update_output_hides_credentials(
+    slp_holding_urls, tmp_path, prefix, heading
+):
+    """The lines reporting what `sio filenames` changed show URLs masked."""
+    args = ["filenames", slp_holding_urls, "-o", str(tmp_path / "updated.slp")]
+    result = CliRunner().invoke(cli, [*args, "--prefix", *prefix])
+
+    assert result.exit_code == 0, result.output
+    out = _without_wrapping(result.output)
+    assert heading in out
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+def test_fix_duplicate_videos_verbose_output_hides_credentials(
+    slp_holding_urls, tmp_path
+):
+    """`sio fix -v` lists duplicate videos and color checks with URLs masked."""
+    labels = load_slp(slp_holding_urls, open_videos=False)
+    labels.videos.append(Video(filename=labels.videos[0].filename, open_backend=False))
+    path = tmp_path / "duplicates.slp"
+    save_slp(labels, str(path), embed=False)
+
+    result = CliRunner().invoke(cli, ["fix", str(path), "--dry-run", "--verbose"])
+
+    assert result.exit_code == 0, result.output
+    out = _without_wrapping(result.output)
+    assert "Canonical:" in out
+    assert "Duplicate:" in out
+    assert "VideoColor:" in out
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["trim", "-o", "{tmp}/t.slp"],
+        ["reencode", "-o", "{tmp}/r.slp", "--dry-run"],
+        ["transform", "-o", "{tmp}/tr.slp", "--scale", "0.5", "--dry-run"],
+        ["embed", "-o", "{tmp}/e.pkg.slp"],
+        ["render", "-o", "{tmp}/r.mp4", "--lf", "0"],
+        ["convert", "-o", "{tmp}/c.slp"],
+    ],
+    ids=lambda args: args[0],
+)
+def test_commands_failing_on_a_file_holding_urls_hide_credentials(
+    slp_holding_urls, tmp_path, args
+):
+    """These can't read the video, and say so without its credentials."""
+    command, *rest = args
+    result = CliRunner().invoke(
+        cli, [command, slp_holding_urls, *(a.format(tmp=tmp_path) for a in rest)]
+    )
+
+    out = _without_wrapping(result.output) + str(result.exception)
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["trim", "{url}", "-o", "{tmp}/out.slp"],
+        ["reencode", "{url}", "-o", "{tmp}/out.mp4"],
+        ["merge", "{url}", "{url}", "-o", "{tmp}/out.slp"],
+        ["transform", "{url}", "-o", "{tmp}/out.slp"],
+        ["unsplit", "{url}", "-o", "{tmp}/out.slp"],
+        ["apply-crops", "{url}", "-o", "{tmp}/out.slp"],
+    ],
+    ids=lambda args: args[0],
+)
+def test_local_only_command_refusing_a_url_hides_credentials(tmp_path, args):
+    """Click's own error quotes what it was given, so that's masked on the way out."""
+    url = f"https://host.invalid/a.slp?{_SIGNED_QUERY}"
+    result = CliRunner().invoke(cli, [a.format(url=url, tmp=tmp_path) for a in args])
+
+    assert result.exit_code != 0
+    out = _without_wrapping(result.output)
+    assert "doesnotexist" in out
+    assert "AKIAEXAMPLE" not in out
+    assert "5c0f3e7a" not in out
 
 
 def test_fix_url_input_dry_run_hides_signed_url_credentials():

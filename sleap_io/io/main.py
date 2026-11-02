@@ -1527,7 +1527,8 @@ def _load_file_url(
         if sniff is False:
             raise ValueError(
                 "Cannot infer format for a Google Drive URL when sniff=False "
-                f"(Drive links carry no file extension): '{filename}'. Pass an "
+                "(Drive links carry no file extension): "
+                f"'{_remote._redact_url(filename)}'. Pass an "
                 "explicit format= (e.g. 'slp')."
             )
         return _dispatch_gdrive_url_format(filename, **kwargs)
@@ -1766,7 +1767,10 @@ def save_file(
         }
         save_csv(labels, filename, format=csv_format, **csv_kwargs)
     else:
-        raise ValueError(f"Unknown format '{format}' for filename: '{filename}'.")
+        from sleap_io.io._remote import _display_filename
+
+        shown = _display_filename(filename)
+        raise ValueError(f"Unknown format '{format}' for filename: '{shown}'.")
 
 
 def load_skeleton(filename: str | Path) -> Skeleton | list[Skeleton]:

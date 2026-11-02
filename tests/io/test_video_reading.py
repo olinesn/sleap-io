@@ -2,6 +2,7 @@
 
 import copy
 import pickle
+import traceback
 from pathlib import Path
 
 import h5py
@@ -10,6 +11,7 @@ import numpy as np
 import pytest
 from numpy.testing import assert_equal
 from pytest_httpserver import HTTPServer
+from werkzeug.wrappers import Response
 
 import sleap_io as sio
 from sleap_io.io.video_reading import (
@@ -1996,6 +1998,180 @@ def test_remote_video_open_error_hides_signed_url_credentials():
     message = str(exc_info.value)
     assert "AKIAEXAMPLE" not in message
     assert "TOPSECRET" not in message
+
+
+def _everything_shown(e: BaseException) -> str:
+    """Return the whole traceback of an error, which walks its cause and context."""
+    return "".join(traceback.format_exception(type(e), e, e.__traceback__))
+
+
+@pytest.mark.parametrize(
+    "read",
+    [
+        lambda video: video[0],
+        lambda video: video[[0, 1]],
+        lambda video: video.backend[0],
+        lambda video: video.backend.get_frames([0, 1]),
+        lambda video: video.backend.read_test_frame(),
+        lambda video: video.backend.num_frames,
+        lambda video: video.backend.img_shape,
+        lambda video: video.backend.reader,
+    ],
+    ids=[
+        "video[0]",
+        "video[[0, 1]]",
+        "backend[0]",
+        "get_frames",
+        "read_test_frame",
+        "num_frames",
+        "img_shape",
+        "reader",
+    ],
+)
+def test_remote_video_decode_failure_shows_no_credential(httpserver, read):
+    """A body FFmpeg can't decode is a `RemoteIOError`: imageio quotes the URL."""
+    httpserver.expect_request("/junk.mp4").respond_with_data(b"\x07" * 4096)
+    url = httpserver.url_for("/junk.mp4") + f"?{_SIGNED_VIDEO_QUERY}"
+    video = sio.load_video(url)
+
+    with pytest.raises(sio.RemoteIOError, match="could not read the video") as exc_info:
+        read(video)
+    shown = _everything_shown(exc_info.value)
+    assert "AKIAEXAMPLE" not in shown
+    assert "TOPSECRET" not in shown
+
+
+def test_remote_video_decode_failure_keep_open_false(httpserver):
+    """The read that opens the file each time is guarded too."""
+    httpserver.expect_request("/junk.mp4").respond_with_data(b"\x07" * 4096)
+    url = httpserver.url_for("/junk.mp4") + f"?{_SIGNED_VIDEO_QUERY}"
+    backend = MediaVideo(url, keep_open=False, plugin="pyav")
+
+    with pytest.raises(sio.RemoteIOError) as exc_info:
+        backend.read_test_frame()
+    assert "TOPSECRET" not in _everything_shown(exc_info.value)
+
+
+@pytest.mark.parametrize(
+    "read",
+    [lambda backend: backend.get_frame(0), lambda backend: backend.get_frames([0])],
+    ids=["get_frame", "get_frames"],
+)
+def test_remote_video_decode_failure_after_shape_is_known(httpserver, read):
+    """Reading a frame is guarded itself: a known shape skips what would fail first."""
+    httpserver.expect_request("/junk.mp4").respond_with_data(b"\x07" * 4096)
+    url = httpserver.url_for("/junk.mp4") + f"?{_SIGNED_VIDEO_QUERY}"
+    backend = MediaVideo(url, keep_open=False, plugin="pyav")
+    backend._cached_shape = (10, 4, 4, 1)
+
+    with pytest.raises(sio.RemoteIOError) as exc_info:
+        read(backend)
+    assert "TOPSECRET" not in _everything_shown(exc_info.value)
+
+
+def test_remote_video_frame_out_of_range_stays_index_error(
+    httpserver, small_robot_path
+):
+    """Asking for a frame that isn't there isn't a network failure."""
+    httpserver.expect_request("/movie.mp4").respond_with_data(
+        Path(small_robot_path).read_bytes(), content_type="video/mp4"
+    )
+    url = httpserver.url_for("/movie.mp4") + "?token=TOPSECRET"
+
+    with pytest.raises(IndexError, match="out of range") as exc_info:
+        sio.load_video(url)[10_000_000]
+    assert "TOPSECRET" not in _everything_shown(exc_info.value)
+
+
+def test_local_video_errors_come_through_as_they_are(tmp_path):
+    """A local file that can't be decoded raises what it always did."""
+    path = tmp_path / "junk.mp4"
+    path.write_bytes(b"\x07" * 4096)
+    with pytest.raises(Exception) as exc_info:
+        MediaVideo(str(path), plugin="pyav").read_test_frame()
+    assert not isinstance(exc_info.value, sio.RemoteIOError)
+
+
+def test_from_filename_unknown_type_hides_url_credentials():
+    """The unknown-type error names a URL without its credentials."""
+    url = f"https://example.com/video.bin?{_SIGNED_VIDEO_QUERY}"
+    with pytest.raises(ValueError, match="Unknown video file type") as exc_info:
+        VideoBackend.from_filename(url)
+    assert "TOPSECRET" not in str(exc_info.value)
+    assert "https://example.com/video.bin" in str(exc_info.value)
+
+
+def test_image_video_opencv_failure_hides_url_credentials():
+    """OpenCV's failure to read an image names the URL without its credentials."""
+    backend = ImageVideo(
+        ["https://host.invalid/a.png?token=TOPSECRET"], plugin="opencv"
+    )
+    with pytest.raises(ValueError, match="Failed to read image") as exc_info:
+        backend._read_frame(0)
+    assert "TOPSECRET" not in str(exc_info.value)
+
+
+def test_opencv_prints_no_url_credentials(capfd, httpserver):
+    """OpenCV prints to stderr from C++, where nothing could mask a URL afterwards."""
+    httpserver.expect_request("/junk.mp4").respond_with_data(b"\x07" * 4096)
+    url = httpserver.url_for("/junk.mp4") + "?token=TOPSECRET"
+
+    capture = MediaVideo(url, plugin="opencv").reader
+    assert not capture.isOpened()
+    backend = ImageVideo(["http://127.0.0.1:9/a.png?token=TOPSECRET"], plugin="opencv")
+    with pytest.raises(ValueError, match="Failed to read image"):
+        backend._read_frame(0)
+
+    captured = capfd.readouterr()
+    assert "TOPSECRET" not in captured.out + captured.err
+
+
+def test_opencv_reads_a_remote_video(httpserver, small_robot_path):
+    """Asking for FFmpeg by name still reads a URL, keeping the query in the request."""
+    seen = []
+
+    def handler(request):
+        seen.append(request.query_string.decode())
+        data = Path(small_robot_path).read_bytes()
+        rng = request.headers.get("Range")
+        if not rng:
+            return Response(data, content_type="video/mp4")
+        start_s, _, end_s = rng.split("=", 1)[1].partition("-")
+        start, end = int(start_s), int(end_s) if end_s else len(data) - 1
+        resp = Response(data[start : end + 1], status=206, content_type="video/mp4")
+        resp.headers["Content-Range"] = f"bytes {start}-{end}/{len(data)}"
+        return resp
+
+    httpserver.expect_request("/movie.mp4").respond_with_handler(handler)
+    url = httpserver.url_for("/movie.mp4") + "?token=TOPSECRET"
+
+    frame = MediaVideo(url, plugin="opencv", grayscale=True)[0]
+    assert frame.shape == (320, 560, 1)
+    assert seen
+    assert all(query == "token=TOPSECRET" for query in seen)
+
+
+def test_backend_repr_hides_url_credentials(tmp_path):
+    """A backend's `repr` masks its filename, its source and what it wraps."""
+    url = f"https://host.invalid/video.mp4?{_SIGNED_VIDEO_QUERY}"
+    media = MediaVideo(url, plugin="pyav")
+    assert "TOPSECRET" not in repr(media)
+    assert "AKIAEXAMPLE" not in repr(media)
+    assert "https://host.invalid/video.mp4" in repr(media)
+
+    assert "TOPSECRET" not in repr(CropVideoBackend(inner=media, crop=(0, 0, 1, 1)))
+
+    path = tmp_path / "frames.h5"
+    with h5py.File(path, "w") as f:
+        f.create_dataset("video", data=np.zeros((1, 2, 2, 1), dtype="uint8"))
+    embedded = HDF5Video(str(path), dataset="video", source_filename=url)
+    assert "TOPSECRET" not in repr(embedded)
+
+
+def test_backend_repr_local_filename_unchanged(centered_pair_low_quality_path):
+    """A local filename is shown as it always was."""
+    backend = MediaVideo(centered_pair_low_quality_path, plugin="pyav")
+    assert f"filename={centered_pair_low_quality_path!r}" in repr(backend)
 
 
 def test_is_pyav_available_when_installed():

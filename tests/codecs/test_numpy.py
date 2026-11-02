@@ -1119,6 +1119,16 @@ def test_to_analysis_arrays_no_labeled_frames():
         to_analysis_arrays(labels)
 
 
+def test_to_analysis_arrays_no_labeled_frames_hides_url_credentials():
+    """The no-frames error names a URL without its credentials."""
+    video = Video(filename="https://host/v.mp4?token=SECRET", open_backend=False)
+    labels = Labels(videos=[video], skeletons=[Skeleton(["pt"])])
+
+    with pytest.raises(ValueError, match="No labeled frames") as ei:
+        to_analysis_arrays(labels)
+    assert "SECRET" not in str(ei.value)
+
+
 def test_to_analysis_arrays_video_index():
     """A video may be selected by integer index."""
     skeleton = Skeleton(["pt"])

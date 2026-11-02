@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Callable, Iterator, Literal
 import numpy as np
 from attrs import define, field
 
+from sleap_io.io._remote import _display_filename
 from sleap_io.io.utils import sanitize_filename
 from sleap_io.model.camera import RecordingSession
 from sleap_io.model.category import Category
@@ -1676,9 +1677,10 @@ class Labels:
                 return video
 
         def _ambiguous(candidates: list[Video], by: str) -> ValueError:
-            names = ", ".join(repr(v.filename) for v in candidates)
+            names = ", ".join(repr(_display_filename(v.filename)) for v in candidates)
+            shown = _display_filename(query.filename)
             return ValueError(
-                f"Ambiguous video match for {query.filename!r}: matched "
+                f"Ambiguous video match for {shown!r}: matched "
                 f"{len(candidates)} videos {by}: {names}."
             )
 
@@ -1908,7 +1910,8 @@ class Labels:
                         raise ValueError(
                             f"Cannot save with embed=False when overwriting a file "
                             f"that contains embedded videos. Use "
-                            f"labels.save('{filename}', embed=True) to re-embed the "
+                            f"labels.save('{_display_filename(filename)}', embed=True) "
+                            "to re-embed the "
                             f"frames, or save to a different filename."
                         )
 

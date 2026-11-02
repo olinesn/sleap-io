@@ -1,17 +1,20 @@
 """Tests for functions in the sleap_io.io.main file."""
 
+import gc
 import inspect
 import io
 import json
 import shutil
+import traceback
 from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
+from h5py._objects import ObjectID
 
 from sleap_io import Labels, LabelsSet, RemoteIOError, Video, clear_remote_cache
-from sleap_io.io._remote import _require_package
+from sleap_io.io._remote import _require_package, open_url
 from sleap_io.io.main import (
     _gdrive_format_from_bytes,
     load_alphatracker,
@@ -665,6 +668,115 @@ def test_load_slp_url_embedded_pkg_wrong_token_raises(httpserver, slp_minimal_pk
         load_slp(url, headers={"Authorization": "Bearer WRONG"})
 
 
+def _serve_slp_until(httpserver, path, data, limit):
+    """Serve `data` with Range support, refusing ranges starting at or past `limit`.
+
+    Like a signed link that expires partway through a load: the open succeeds, and a
+    later read doesn't.
+    """
+    from werkzeug.wrappers import Response
+
+    def handler(request):
+        total = len(data)
+        ranges = {"Accept-Ranges": "bytes"}
+        if request.method == "HEAD":
+            resp = Response(b"", headers=ranges)
+            resp.headers["Content-Length"] = str(total)
+            return resp
+        if "Range" not in request.headers:
+            return Response(data, headers=ranges)
+        start_s, _, end_s = request.headers["Range"].split("=", 1)[1].partition("-")
+        start = int(start_s)
+        if start >= limit:
+            return Response(b"denied", status=403)
+        end = min(int(end_s) if end_s else total - 1, total - 1)
+        ranges["Content-Range"] = f"bytes {start}-{end}/{total}"
+        return Response(data[start : end + 1], status=206, headers=ranges)
+
+    httpserver.expect_request(path).respond_with_handler(handler)
+
+
+@pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+def test_load_slp_url_later_read_failure_shows_no_credential(
+    httpserver, centered_pair, lazy
+):
+    """A read failing partway through a load shows no credential from the URL."""
+    _serve_slp_until(
+        httpserver, "/labels.slp", Path(centered_pair).read_bytes(), limit=1 << 20
+    )
+    url = (
+        httpserver.url_for("/labels.slp")
+        + "?X-Amz-Signature=TOPSECRET&token=TOPSECRET&key=TOPSECRET"
+    )
+
+    with pytest.raises(RemoteIOError) as exc_info:
+        load_slp(url, retries=0, open_videos=False, lazy=lazy)
+
+    e = exc_info.value
+    assert e.status == 403
+    assert "TOPSECRET" not in "".join(
+        traceback.format_exception(type(e), e, e.__traceback__)
+    )
+
+
+def _h5py_objects_left_for_the_garbage_collector(load) -> list:
+    """Run a load that fails, and return the h5py objects only a collection would free.
+
+    Args:
+        load: A callable that raises `RemoteIOError`.
+
+    Returns:
+        The h5py objects the failure left in reference cycles.
+    """
+    gc.collect()
+    gc.disable()
+    gc.set_debug(gc.DEBUG_SAVEALL)
+    try:
+        with pytest.raises(RemoteIOError):
+            load()
+        gc.collect()
+        return [obj for obj in gc.garbage if isinstance(obj, ObjectID)]
+    finally:
+        gc.set_debug(0)
+        gc.garbage.clear()
+        gc.enable()
+
+
+@pytest.mark.parametrize("lazy", [False, True], ids=["eager", "lazy"])
+def test_load_slp_url_later_read_failure_leaves_nothing_to_deadlock_on(
+    httpserver, centered_pair, lazy
+):
+    """A failed load leaves no h5py objects for the garbage collector.
+
+    If it did, the collector could free them on fsspec's thread during the next load,
+    wanting h5py's global lock while the read holding it waits on that thread. Both
+    wait forever, so a retry after a failure would hang.
+    """
+    _serve_slp_until(
+        httpserver, "/labels.slp", Path(centered_pair).read_bytes(), limit=1 << 20
+    )
+    url = httpserver.url_for("/labels.slp")
+
+    def load():
+        load_slp(url, retries=0, open_videos=False, lazy=lazy)
+
+    assert _h5py_objects_left_for_the_garbage_collector(load) == []
+
+
+def test_h5py_name_of_a_remote_file_shows_no_credential(httpserver, slp_minimal):
+    """h5py names a file object by its ``repr``, which fsspec's holds the URL in."""
+    data = Path(slp_minimal).read_bytes()
+    _serve_slp_until(httpserver, "/labels.slp", data, limit=len(data))
+    url = httpserver.url_for("/labels.slp") + "?token=TOPSECRET"
+
+    file = open_url(url, retries=0)
+    with h5py.File(file, "r") as f:
+        assert "metadata" in f
+        assert "TOPSECRET" not in f.filename
+        assert "TOPSECRET" not in repr(f)
+    file.close()
+
+
 def test_video_close_releases_remote_url_file(httpserver, slp_minimal_pkg):
     """`Video.close()` deterministically closes the backend's URL file-like."""
     data = Path(slp_minimal_pkg).read_bytes()
@@ -1240,6 +1352,20 @@ def test_load_file_gdrive_url_sniff_false_raises(slp_minimal):
     """`load_file(drive_url, sniff=False)` raises (no extension to fall back on)."""
     with pytest.raises(ValueError, match="Cannot infer format for a Google Drive"):
         load_file("https://drive.google.com/file/d/FILEID/view", sniff=False)
+
+
+def test_load_file_gdrive_url_sniff_false_hides_api_key():
+    """The Drive `sniff=False` error shows no API key from the URL."""
+    with pytest.raises(ValueError, match="Cannot infer format") as ei:
+        load_file("https://drive.google.com/file/d/FILEID/view?key=SECRET", sniff=False)
+    assert "SECRET" not in str(ei.value)
+
+
+def test_save_file_unknown_format_hides_url_credentials():
+    """The unknown-format error of a save names a URL without its credentials."""
+    with pytest.raises(ValueError, match="Unknown format") as ei:
+        save_file(Labels(), "https://host/out.bin?token=SECRET")
+    assert "SECRET" not in str(ei.value)
 
 
 def test_load_slp_gdrive_folder_url_raises(slp_minimal):

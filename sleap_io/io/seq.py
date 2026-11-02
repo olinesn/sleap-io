@@ -25,6 +25,7 @@ import attrs
 import numpy as np
 import simplejson as json
 
+from sleap_io.io._remote import _display_filename
 from sleap_io.io.video_reading import VideoBackend
 
 # Image format codec mapping
@@ -383,7 +384,9 @@ class SeqVideo(VideoBackend):
         """Parse header, build seek index, and compute FPS."""
         path = Path(self.filename)
         if not path.exists():
-            raise FileNotFoundError(f"File not found: {path}")
+            raise FileNotFoundError(
+                f"File not found: {_display_filename(self.filename)}"
+            )
 
         f = open(path, "rb")
         try:

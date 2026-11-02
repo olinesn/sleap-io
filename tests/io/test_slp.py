@@ -6811,6 +6811,56 @@ def test_read_metadata_missing_json_attr_raises_valueerror(tmp_path):
         read_metadata(path)
 
 
+def test_read_metadata_missing_json_attr_hides_url_credentials(tmp_path):
+    """The missing-json error names a URL without its credentials."""
+    path = tmp_path / "missing_json.slp"
+    with h5py.File(path, "w") as f:
+        f.require_group("metadata").attrs["format_id"] = 1.1
+
+    url = "https://host/labels.slp?X-Amz-Signature=SECRET"
+    with h5py.File(path, "r") as f:
+        with pytest.raises(ValueError, match="missing its required") as ei:
+            read_metadata(url, _hdf5_file=f)
+    assert "SECRET" not in str(ei.value)
+    assert "https://host/labels.slp" in str(ei.value)
+
+
+def test_check_format_id_hides_url_credentials(tmp_path):
+    """The too-new-format error names a URL without its credentials."""
+    path = tmp_path / "too_new.slp"
+    with h5py.File(path, "w") as f:
+        f.require_group("metadata").attrs["format_id"] = 3.0
+
+    with h5py.File(path, "r") as f:
+        with pytest.raises(ValueError, match="uses SLP format 3") as ei:
+            _check_format_id("https://host/labels.slp?key=SECRET", f)
+    assert "SECRET" not in str(ei.value)
+    assert "https://host/labels.slp" in str(ei.value)
+
+
+def test_embed_frame_out_of_range_hides_url_credentials(
+    httpserver, tmp_path, small_robot_path
+):
+    """The missing-frame error of an embed names a URL without its credentials."""
+    httpserver.expect_request("/movie.mp4").respond_with_data(
+        Path(small_robot_path).read_bytes(), content_type="video/mp4"
+    )
+    url = httpserver.url_for("/movie.mp4") + "?token=SECRET"
+    frames = [
+        {
+            "video": Video.from_filename(url),
+            "video_ind": 0,
+            "frame_idx": 10_000_000,
+            "group": "v",
+        }
+    ]
+
+    with pytest.raises(IndexError, match="out of range for video") as ei:
+        process_and_embed_frames(str(tmp_path / "labels.slp"), frames, verbose=False)
+    assert "SECRET" not in str(ei.value)
+    assert "/movie.mp4" in str(ei.value)
+
+
 def test_read_labels_missing_json_attr_raises_valueerror(slp_minimal, tmp_path):
     """Test ValueError propagates to read_labels when 'json' attr is missing."""
     # Start from a real .slp file so all other datasets are present, then
