@@ -1959,6 +1959,45 @@ def test_remote_video_open_error_redacts_url():
     assert "token=%2A%2A%2A" in message
 
 
+#: A signed query holding each kind of credential, for the video URL errors below.
+_SIGNED_VIDEO_QUERY = (
+    "X-Goog-Credential=AKIAEXAMPLE&X-Goog-Signature=TOPSECRET"
+    "&Signature=TOPSECRET&key=TOPSECRET"
+)
+
+
+@pytest.mark.parametrize(
+    "url,kwargs,error",
+    [
+        (
+            "https://example.com/video.mp4",
+            {"headers": {"Authorization": "Bearer X"}},
+            ValueError,
+        ),
+        ("s3://bucket/video.mp4", {}, NotImplementedError),
+        ("https://drive.google.com/file/d/abc/view", {}, NotImplementedError),
+    ],
+    ids=["media-auth", "cloud-scheme", "google-drive"],
+)
+def test_from_filename_url_errors_hide_signed_url_credentials(url, kwargs, error):
+    """Errors rejecting a video URL show no signature, access key or API key."""
+    with pytest.raises(error) as exc_info:
+        VideoBackend.from_filename(f"{url}?{_SIGNED_VIDEO_QUERY}", **kwargs)
+    message = str(exc_info.value)
+    assert "AKIAEXAMPLE" not in message
+    assert "TOPSECRET" not in message
+
+
+def test_remote_video_open_error_hides_signed_url_credentials():
+    """A failed open of a signed remote video shows no credential in the error."""
+    video = sio.load_video(f"https://host.invalid/video.mp4?{_SIGNED_VIDEO_QUERY}")
+    with pytest.raises(FileNotFoundError) as exc_info:
+        video[0]
+    message = str(exc_info.value)
+    assert "AKIAEXAMPLE" not in message
+    assert "TOPSECRET" not in message
+
+
 def test_is_pyav_available_when_installed():
     """``_is_pyav_available`` reports True in the test environment (av installed).
 
@@ -2453,3 +2492,30 @@ def test_hdf5_pushdown_embedded_falls_back(slp_minimal_pkg):
     assert cb.detect_grayscale() is True
     ref = crop_frame(inner._read_frame(fidx), (5, 5, 55, 55))
     assert_equal(cb[fidx], ref[..., [0]])
+
+
+def test_hdf5video_img_shape_respects_grayscale(small_robot_path, tmp_path):
+    """Toggling grayscale on an embedded RGB video should update the channel count."""
+    video = sio.load_video(small_robot_path)
+    skeleton = sio.Skeleton(["a"])
+    instance = sio.Instance.from_numpy(np.array([[10.0, 10.0]]), skeleton=skeleton)
+    frame = sio.LabeledFrame(video=video, frame_idx=0, instances=[instance])
+    labels = sio.Labels(videos=[video], skeletons=[skeleton], labeled_frames=[frame])
+    pkg_path = str(tmp_path / "robot.pkg.slp")
+    labels.save(pkg_path, embed="user")
+
+    embedded = sio.load_slp(pkg_path).video
+    assert type(embedded.backend) is HDF5Video
+    assert embedded.shape[-1] == 3
+
+    # Turning grayscale on: shape must match the 1-channel frames.
+    embedded.grayscale = True
+    assert embedded[0].shape[-1] == 1
+    assert embedded.shape[-1] == 1
+    assert embedded.grayscale is True
+
+    # Turning it back off: the toggle must work in both directions.
+    embedded.grayscale = False
+    assert embedded[0].shape[-1] == 3
+    assert embedded.shape[-1] == 3
+    assert embedded.grayscale is False

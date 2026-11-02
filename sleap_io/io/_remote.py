@@ -61,8 +61,37 @@ _GDRIVE_HOSTS = frozenset({"drive.google.com", "docs.google.com"})
 _SENSITIVE_HEADERS = frozenset({"authorization", "cookie", "proxy-authorization"})
 
 #: Query-string parameter names whose values are redacted by :func:`_redact_url`.
+#: Lowercase, and matched whole (``monkey=`` and ``signature_version=`` stay visible).
+#: A name goes here if a service really puts a credential there: masking an ordinary
+#: param (``key`` often is one) only hides a value in a message, and the caller still
+#: has the URL. What says why a signed URL failed (``X-Amz-Date``, ``X-Amz-Expires``,
+#: ``Expires``, ``se``, ...) isn't secret and stays visible on purpose.
 _SENSITIVE_QUERY_PARAMS = frozenset(
-    {"token", "access_token", "x-amz-security-token", "sas", "sig"}
+    {
+        "token",
+        "access_token",
+        "x-amz-security-token",
+        "sas",
+        "sig",
+        # S3 and everything S3-compatible (R2, MinIO, B2's S3 API, Wasabi). The access
+        # key ID isn't secret on its own, but it names the account.
+        "x-amz-signature",
+        "x-amz-credential",
+        "awsaccesskeyid",
+        # Cloud Storage. The credential is the service account's email.
+        "x-goog-signature",
+        "x-goog-credential",
+        "googleaccessid",
+        # The older S3 and Cloud Storage forms, and CloudFront.
+        "signature",
+        # Backblaze B2's own download URLs.
+        "authorization",
+        # API keys. Google's APIs take theirs as ``?key=``.
+        "key",
+        "api_key",
+        "apikey",
+        "api-key",
+    }
 )
 
 #: Magic-byte prefixes mapped to a format family (checked in order).
@@ -101,6 +130,18 @@ _CACHE_KEY_PATTERN = re.compile(r"^[0-9a-f]{32,64}(\.tags)?$")
 #: whitespace or quote so a single URL token is captured.
 _URL_IN_TEXT_PATTERN = re.compile(
     r"(?:" + "|".join(sorted(_URL_SCHEMES)) + r")://[^\s\"'<>]+",
+    re.IGNORECASE,
+)
+
+#: Pattern matching a sensitive query parameter and its value anywhere in text, URL
+#: or no URL: a space or a quote ends what :data:`_URL_IN_TEXT_PATTERN` can see of a
+#: URL, and a name cut from one (``y.slp?token=...``) no longer looks like one. The
+#: ``#`` is for the same parameter in a fragment. Punctuation at the end belongs to
+#: the sentence, not the value.
+_SENSITIVE_PARAM_PATTERN = re.compile(
+    r"([?&#](?:"
+    + "|".join(re.escape(name) for name in sorted(_SENSITIVE_QUERY_PARAMS))
+    + r")=)[^\s\"'<>&#]*[^\s\"'<>&#.,;:!?)]",
     re.IGNORECASE,
 )
 
@@ -215,8 +256,11 @@ def _redact_url(url: str) -> str:
     """Strip credentials from a URL for safe logging/error display.
 
     ``https://user:pass@host/path?token=xyz`` becomes
-    ``https://***:***@host/path?token=%2A%2A%2A``. Userinfo is replaced and
-    token-like query parameters have their values redacted.
+    ``https://***:***@host/path?token=%2A%2A%2A``. Userinfo is replaced and the
+    query parameters in :data:`_SENSITIVE_QUERY_PARAMS` (tokens, signed URLs'
+    signatures and access keys, API keys) have their values redacted, in the
+    fragment too. The result is for display only: the original URL is what gets
+    requested.
 
     Args:
         url: The URL to redact.
@@ -242,7 +286,11 @@ def _redact_url(url: str) -> str:
         new_query = urllib.parse.urlencode(redacted_params)
     else:
         new_query = ""
-    return urllib.parse.urlunparse(parsed._replace(netloc=netloc, query=new_query))
+    # An unencoded ``#`` in a path pushes the query here, so mask the fragment too.
+    fragment = _SENSITIVE_PARAM_PATTERN.sub(r"\1***", f"#{parsed.fragment}")[1:]
+    return urllib.parse.urlunparse(
+        parsed._replace(netloc=netloc, query=new_query, fragment=fragment)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -789,7 +837,9 @@ def _redacted_cause_summary(e: BaseException) -> str:
     userinfo password or a ``?token=`` query parameter) in their string form.
     This returns ``"<TypeName>: <redacted message>"`` so the summary can be
     surfaced to users for debugging without leaking credentials. Every
-    URL-looking substring in the message is run through :func:`_redact_url`.
+    URL-looking substring in the message is run through :func:`_redact_url`, after
+    masking listed parameters by name (:data:`_SENSITIVE_PARAM_PATTERN`) for the
+    URLs a quote or space cuts short.
 
     Args:
         e: The underlying exception.
@@ -803,7 +853,10 @@ def _redacted_cause_summary(e: BaseException) -> str:
         # Some exceptions (e.g. an aiohttp.ClientResponseError without a
         # request_info) raise from their own __str__; fall back to the type name.
         return type(e).__name__
-    redacted = _URL_IN_TEXT_PATTERN.sub(lambda m: _redact_url(m.group(0)), raw)
+    # By name first: aiohttp's message turns ``%27`` back into ``'``, which cuts even
+    # a real signed URL short of its query.
+    redacted = _SENSITIVE_PARAM_PATTERN.sub(r"\1***", raw)
+    redacted = _URL_IN_TEXT_PATTERN.sub(lambda m: _redact_url(m.group(0)), redacted)
     redacted = redacted.replace("\n", " ").replace("\r", " ").strip()
     if redacted:
         return f"{type(e).__name__}: {redacted}"

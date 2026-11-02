@@ -48,9 +48,13 @@ from sleap_io.io.slp import (
     OWNER_INSTANCE,
     OWNER_MASK,
     OWNER_ROI,
+    SLP_FORMAT_ID_LIMIT,
     ExportCancelled,
     LabelImageWriter,
+    _check_format_id,
+    _create_json_rows_dataset,
     _encode_metadata_attr,
+    _identity_index,
     _identity_link_rows_for_owner,
     _is_known_toplevel_name,
     _points_from_hdf5_data,
@@ -113,6 +117,7 @@ from sleap_io.io.slp import (
     write_labels,
     write_lfs,
     write_metadata,
+    write_negative_frames,
     write_sessions,
     write_suggestions,
     write_tracks,
@@ -2527,6 +2532,74 @@ def test_can_use_fast_path_non_embedded_hdf5(tmpdir):
 
     # Should NOT use fast path - has HDF5Video backend but no embedded images
     assert can_use_fast_path(video, 0, "png") is False
+
+
+def _write_rgb_pkg(pkg_path: str, source_path: str):
+    """Embed the first frame of an RGB video into a package at `pkg_path`."""
+    video = Video.from_filename(source_path)
+    skeleton = Skeleton(["a"])
+    instance = Instance.from_numpy(np.array([[10.0, 10.0]]), skeleton=skeleton)
+    frame = LabeledFrame(video=video, frame_idx=0, instances=[instance])
+    labels = Labels(videos=[video], skeletons=[skeleton], labeled_frames=[frame])
+    write_labels(pkg_path, labels, embed="user")
+
+
+def test_can_use_fast_path_grayscale(tmpdir, small_robot_path, slp_minimal_pkg):
+    """Grayscale blocks the fast path only when the stored frames are multi-channel."""
+    # An RGB package: the stored bytes decode to 3 channels, but a grayscale video
+    # records 1, so they cannot be copied verbatim.
+    pkg_path = str(tmpdir / "rgb.pkg.slp")
+    _write_rgb_pkg(pkg_path, small_robot_path)
+    rgb = read_labels(pkg_path).video
+    assert rgb.backend.stored_channels == 3
+    assert can_use_fast_path(rgb, 0, "png") is True
+
+    rgb.grayscale = True
+    assert can_use_fast_path(rgb, 0, "png") is False
+
+    # Frames that are already single-channel are unaffected: nothing is lost by
+    # copying them verbatim, so a genuinely grayscale package keeps its fast path.
+    gray = read_labels(slp_minimal_pkg).video
+    assert gray.backend.stored_channels == 1
+    gray.grayscale = True
+    assert can_use_fast_path(gray, 0, "png") is True
+
+
+def test_embed_grayscale_round_trip_keeps_shape_and_frames_in_sync(
+    tmpdir, small_robot_path
+):
+    """A grayscale-toggled package must reload with its shape and frames agreeing.
+
+    The channel count stored in the dataset attrs comes from `video.shape`, which is 1
+    once grayscale is set. If the RGB bytes were copied verbatim they would still
+    decode to 3 channels, so the reloaded video would report a shape that its own
+    frames contradict, and grayscale could never be toggled back off.
+    """
+    pkg_path = str(tmpdir / "rgb.pkg.slp")
+    _write_rgb_pkg(pkg_path, small_robot_path)
+
+    labels = read_labels(pkg_path)
+    assert labels.video.shape[-1] == 3
+    labels.video.grayscale = True
+
+    gray_path = str(tmpdir / "gray.pkg.slp")
+    write_labels(gray_path, labels, embed="user")
+
+    # The frames must have been re-encoded as single-channel, not byte-copied, so the
+    # recorded channel count describes the pixels that are actually stored.
+    with h5py.File(gray_path) as f:
+        assert f["video0/video"].attrs["channels"] == 1
+
+    reloaded = read_labels(gray_path).video
+    assert reloaded.backend.stored_channels == 1
+    assert reloaded.shape[-1] == 1
+    assert reloaded[0].shape[-1] == 1
+
+    # Toggling grayscale back off must not strand the shape: the stored frames really
+    # are single-channel now, so the shape and the frames must still agree.
+    reloaded.grayscale = False
+    assert reloaded[0].shape[-1] == 1
+    assert reloaded.shape[-1] == 1
 
 
 def test_fast_path_progress_callback_cancellation(tmpdir, slp_minimal_pkg):
@@ -11074,7 +11147,114 @@ def test_uncropped_writes_no_video_crops_and_golden_videos_json(slp_minimal, tmp
 
     # videos_json is byte-identical to a baseline save.
     with h5py.File(baseline, "r") as f1, h5py.File(candidate, "r") as f2:
-        assert f1["videos_json"][:].tobytes() == f2["videos_json"][:].tobytes()
+        assert list(f1["videos_json"][:]) == list(f2["videos_json"][:])
+
+
+def test_json_row_datasets_written_as_vlen_strings(slp_multiview, tmp_path):
+    """videos/tracks/suggestions/sessions JSON rows are stored unpadded (vlen)."""
+    labels = load_slp(slp_multiview)
+    labels.suggestions.append(SuggestionFrame(video=labels.videos[0], frame_idx=0))
+    path = tmp_path / "labels.slp"
+    labels.save(path)
+
+    with h5py.File(path, "r") as f:
+        for name in ("videos_json", "tracks_json", "suggestions_json", "sessions_json"):
+            string_info = h5py.check_string_dtype(f[name].dtype)
+            assert string_info is not None and string_info.length is None, name
+
+    loaded = load_slp(path)
+    assert [v.filename for v in loaded.videos] == [v.filename for v in labels.videos]
+    assert [t.name for t in loaded.tracks] == [t.name for t in labels.tracks]
+    assert len(loaded.suggestions) == 1
+    assert len(loaded.sessions) == 1
+    assert len(loaded.sessions[0].camera_group.cameras) == len(
+        labels.sessions[0].camera_group.cameras
+    )
+
+
+def test_read_fixed_width_json_row_datasets(slp_multiview, tmp_path):
+    """Files with legacy fixed-width JSON row datasets still load identically."""
+    labels = load_slp(slp_multiview)
+    labels.suggestions.append(SuggestionFrame(video=labels.videos[1], frame_idx=3))
+    path = tmp_path / "labels.slp"
+    labels.save(path)
+    expected = load_slp(path)
+
+    # Rewrite each row dataset in the old fixed-width (zero-padded) layout.
+    with h5py.File(path, "a") as f:
+        for name in ("videos_json", "tracks_json", "suggestions_json", "sessions_json"):
+            rows = list(f[name][:])
+            del f[name]
+            f.create_dataset(name, data=np.array(rows, dtype="S"), maxshape=(None,))
+            assert f[name].dtype.kind == "S"
+
+    loaded = load_slp(path)
+    assert [v.filename for v in loaded.videos] == [v.filename for v in expected.videos]
+    assert [t.name for t in loaded.tracks] == [t.name for t in expected.tracks]
+    assert [
+        (loaded.videos.index(s.video), s.frame_idx) for s in loaded.suggestions
+    ] == [(1, 3)]
+    assert len(loaded.sessions) == len(expected.sessions)
+
+    # Re-saving a legacy file (eagerly or via the lazy passthrough) upgrades it.
+    for lazy in (False, True):
+        resaved = tmp_path / f"resaved_{lazy}.slp"
+        load_slp(path, lazy=lazy).save(resaved)
+        with h5py.File(resaved, "r") as f:
+            assert h5py.check_string_dtype(f["videos_json"].dtype).length is None
+            assert h5py.check_string_dtype(f["sessions_json"].dtype).length is None
+        assert len(load_slp(resaved).sessions) == len(expected.sessions)
+
+
+def test_create_json_rows_dataset_accepts_str_and_bytes(tmp_path):
+    """JSON rows can be passed as str, bytes, or an array read from a dataset."""
+    path = tmp_path / "rows.h5"
+    with h5py.File(path, "w") as f:
+        _create_json_rows_dataset(f, "from_str", ['{"a":1}', "[2]"])
+        _create_json_rows_dataset(f, "from_bytes", [np.bytes_(b'{"a":1}'), b"[2]"])
+        _create_json_rows_dataset(f, "from_array", f["from_str"][:])
+        _create_json_rows_dataset(f, "empty", [])
+        for name in ("from_str", "from_bytes", "from_array"):
+            assert [json.loads(x) for x in f[name][:]] == [{"a": 1}, [2]]
+        assert f["empty"].shape == (0,)
+
+
+@pytest.mark.parametrize(
+    "unregistered", ["frame_video", "track", "suggestion", "negative"]
+)
+def test_write_labels_rejects_unregistered_references(unregistered, tmp_path):
+    """References to videos/tracks missing from the catalogs raise on save."""
+    skeleton = Skeleton(["a"])
+    video = Video(filename="a.mp4", open_backend=False)
+    other = Video(filename="b.mp4", open_backend=False)
+    labels = Labels(videos=[video], skeletons=[skeleton])
+    points = np.array([[1.0, 2.0]])
+    if unregistered == "frame_video":
+        inst = Instance.from_numpy(points, skeleton=skeleton)
+        labels.labeled_frames.append(LabeledFrame(other, 0, instances=[inst]))
+    elif unregistered == "track":
+        inst = Instance.from_numpy(points, skeleton=skeleton, track=Track("t"))
+        labels.labeled_frames.append(LabeledFrame(video, 0, instances=[inst]))
+    elif unregistered == "suggestion":
+        labels.suggestions.append(SuggestionFrame(video=other, frame_idx=0))
+    else:
+        labels.labeled_frames.append(LabeledFrame(other, 0, is_negative=True))
+
+    path = str(tmp_path / "labels.slp")
+    with pytest.raises(ValueError, match="is not in list"):
+        if unregistered == "negative":
+            # Called directly: through write_labels, write_lfs rejects it first.
+            write_negative_frames(path, labels)
+        else:
+            write_labels(path, labels)
+
+
+def test_identity_index_maps_first_occurrence():
+    """`_identity_index` keys by object identity and keeps the first position."""
+    a, b = Track(name="same"), Track(name="same")
+    index = _identity_index([a, b, a])
+    assert index == {id(a): 0, id(b): 1}
+    assert index.get(id(Track(name="same")), -1) == -1
 
 
 def test_crop_format_id_bumped_only_with_crop(
@@ -11880,3 +12060,86 @@ def test_slp_event_video_survives_embed(tmp_path):
     # The video reference survives and points at the (embedded) catalog video.
     assert ev.video is not None
     assert ev.video in loaded.videos
+
+
+def _copy_with_format_id(src: str, dst: Path, format_id: float) -> str:
+    """Copy an SLP file and overwrite its `/metadata` `format_id` attribute."""
+    shutil.copy(src, dst)
+    with h5py.File(dst, "r+") as f:
+        f["metadata"].attrs["format_id"] = format_id
+    return str(dst)
+
+
+def test_format_id_limit_is_3():
+    """Format 3.0 (columnar tables) is the first one this release refuses."""
+    assert SLP_FORMAT_ID_LIMIT == 3.0
+
+
+def test_read_labels_newer_format_raises(tmp_path, slp_minimal):
+    """Eager loading refuses a file whose format is newer than supported."""
+    path = _copy_with_format_id(slp_minimal, tmp_path / "future.slp", 3.0)
+    with pytest.raises(ValueError, match=r"SLP format 3, which is newer.*max 2\.x"):
+        read_labels(path)
+    with pytest.raises(ValueError, match="upgrade sleap-io"):
+        load_slp(path)
+
+
+def test_read_labels_lazy_newer_format_raises(tmp_path, slp_minimal):
+    """Lazy loading refuses a file whose format is newer than supported."""
+    path = _copy_with_format_id(slp_minimal, tmp_path / "future.slp", 3.1)
+    with pytest.raises(ValueError, match=r"SLP format 3\.1, which is newer"):
+        load_slp(path, lazy=True)
+
+
+def test_read_labels_newer_format_checked_before_tables(tmp_path, slp_minimal):
+    """The format check runs before any table is read."""
+    path = _copy_with_format_id(slp_minimal, tmp_path / "future.slp", 3.0)
+    with h5py.File(path, "r+") as f:
+        # A 3.0 file stores `/points` as a group of columns, which the 2.x readers
+        # can't slice. The clear error must come before that h5py failure.
+        del f["points"]
+        f.create_group("points")
+    with pytest.raises(ValueError, match="newer than this version of sleap-io"):
+        read_labels(path)
+    with pytest.raises(ValueError, match="newer than this version of sleap-io"):
+        load_slp(path, lazy=True)
+
+
+def test_read_labels_set_newer_format_raises(tmp_path, slp_minimal):
+    """`read_labels_set` refuses a file whose format is newer than supported."""
+    shutil.copy(slp_minimal, tmp_path / "train.slp")
+    _copy_with_format_id(slp_minimal, tmp_path / "val.slp", 3.0)
+    with pytest.raises(ValueError, match="val.slp uses SLP format 3"):
+        read_labels_set(tmp_path)
+
+
+def test_merge_label_images_newer_format_raises(tmp_path, slp_minimal):
+    """`merge_label_images` refuses a source whose format is newer than supported."""
+    src = _copy_with_format_id(slp_minimal, tmp_path / "future.slp", 3.0)
+    with pytest.raises(ValueError, match="newer than this version of sleap-io"):
+        merge_label_images([src], tmp_path / "merged.slp")
+
+
+def test_read_labels_format_2_8_still_loads(tmp_path, slp_minimal):
+    """The newest 2.x format still loads, eagerly and lazily."""
+    expected = read_labels(slp_minimal)
+    # Re-save with the current writer so the file has every field a 2.x reader reads.
+    resaved = tmp_path / "resaved.slp"
+    save_slp(expected, str(resaved))
+    path = _copy_with_format_id(str(resaved), tmp_path / "v2_8.slp", 2.8)
+    labels = read_labels(path)
+    assert len(labels) == len(expected)
+    np.testing.assert_array_equal(labels.numpy(), expected.numpy())
+    lazy = load_slp(path, lazy=True)
+    np.testing.assert_array_equal(lazy.numpy(), expected.numpy())
+
+
+def test_check_format_id_without_format_id(tmp_path, slp_minimal):
+    """Files without a `format_id` attribute or `/metadata` group pass the check."""
+    path = tmp_path / "no_format_id.slp"
+    shutil.copy(slp_minimal, path)
+    with h5py.File(path, "r+") as f:
+        del f["metadata"].attrs["format_id"]
+        _check_format_id(str(path), f)
+        del f["metadata"]
+        _check_format_id(str(path), f)

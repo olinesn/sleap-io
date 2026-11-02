@@ -216,6 +216,11 @@ file.slp
 | `events/` | group | Frame-spanning event annotations: columnar per-field datasets + ragged CSR `scores`/`score_offsets` framewise traces (Format 2.6+, optional) |
 | `provenance_json` | `bytes` | JSON object of provenance metadata (optional) |
 
+`videos_json`, `tracks_json`, `suggestions_json` and `sessions_json` hold one JSON
+document per row and are written as variable-length UTF-8 strings. Files written by older versions of sleap-io (and by
+SLEAP) store them as fixed-width, zero-padded byte strings instead; both layouts
+are read identically.
+
 ### Provenance storage and the 64 KB metadata limit
 
 The skeletons and nodes live in the `metadata/@json` HDF5 *attribute*. HDF5 caps
@@ -967,7 +972,7 @@ point_dtype = np.dtype([
     ("x", "f8"),        # X coordinate
     ("y", "f8"),        # Y coordinate
     ("visible", "?"),   # Is point visible
-    ("complete", "?"),  # Is point marked complete
+    ("complete", "?"),  # Human-edited in SLEAP GUI (not interpreted)
 ])
 ```
 
@@ -978,7 +983,7 @@ predicted_point_dtype = np.dtype([
     ("x", "f8"),        # X coordinate
     ("y", "f8"),        # Y coordinate
     ("visible", "?"),   # Is point visible
-    ("complete", "?"),  # Is point marked complete
+    ("complete", "?"),  # Human-edited in SLEAP GUI (not interpreted)
     ("score", "f8"),    # Prediction confidence
 ])
 ```
@@ -1572,6 +1577,8 @@ Different data structures use different on-disk representations, chosen per subs
 ## Version History
 
 The SLP format has evolved through several versions, tracked by the `format_id` attribute in `/metadata`.
+
+sleap-io refuses files whose `format_id` is at or above `SLP_FORMAT_ID_LIMIT` (currently `3.0`), raising a `ValueError` that asks you to upgrade sleap-io before any table is read. Files without a `format_id` are not affected by this check.
 
 ### Format 1.0
 
