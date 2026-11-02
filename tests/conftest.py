@@ -24,9 +24,11 @@ def no_collection_while_reading_from_a_server(request):
     """Keep the garbage collector off during a test that uses a local HTTP server.
 
     h5py holds its global lock while it reads a file object, and a URL's file object
-    waits for fsspec's thread. If the collector runs on that thread and frees an h5py
-    object left over from an earlier test, it waits for that same lock. Neither can go
-    on, and the test hangs for good. Collecting here, on the main thread, is safe.
+    waits for the server, which here is a thread in this process. If the collector runs
+    on that thread and frees an h5py object left over from an earlier test, it waits for
+    that same lock. Neither can go on, and the test hangs for good. Collecting here, on
+    the main thread, is safe. `_guard_collection_on_read_threads` does this for fsspec's
+    thread, but it can't know about a server's.
     """
     if not {"httpserver", "httpserver_dual"} & set(request.fixturenames):
         yield

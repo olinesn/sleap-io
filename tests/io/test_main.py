@@ -748,9 +748,8 @@ def test_load_slp_url_later_read_failure_leaves_nothing_to_deadlock_on(
 ):
     """A failed load leaves no h5py objects for the garbage collector.
 
-    If it did, the collector could free them on fsspec's thread during the next load,
-    wanting h5py's global lock while the read holding it waits on that thread. Both
-    wait forever, so a retry after a failure would hang.
+    If it did, the file would stay open until a collection found them, and that
+    collection would have to keep clear of h5py's global lock if a retry were reading.
     """
     _serve_slp_until(
         httpserver, "/labels.slp", Path(centered_pair).read_bytes(), limit=1 << 20

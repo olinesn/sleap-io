@@ -1092,9 +1092,9 @@ def _raise_if_remote_failure(
     range, say) is the caller's to raise again as it was.
 
     The failure must not stay in a reference cycle. The frames in its traceback can
-    hold h5py objects, and if the garbage collector frees those on fsspec's thread
-    while a later read waits on that thread holding h5py's global lock, both wait
-    forever. So a load retried after a failure would hang.
+    hold h5py objects, so the file would stay open until a collection found them, and
+    that collection has to keep clear of h5py's lock while a retry is reading (see
+    :func:`_guard_collection_on_read_threads`).
 
     Args:
         e: The caught exception.
