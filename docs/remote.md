@@ -425,13 +425,15 @@ controlled by `retries=` (default 3).
 - **`ValueError` for a URL** — an ambiguous-extension URL (`.h5`/`.json`/`.csv`)
   with `sniff=False` and no explicit `format=`, or a Google Drive folder /
   unparsable link.
-- **A test that reads from a server in its own process hangs** — h5py holds a
-  global lock while it reads a URL, and the read waits for the server. If the
-  garbage collector runs on the server's thread and frees an h5py object, it waits
-  for that lock too, and neither can go on. Turn the collector off during such a
-  test (`gc.collect()`, then `gc.disable()`), as sleap-io's own tests do. sleap-io
-  takes care of this for its own network threads, so a server in another process
-  isn't affected.
+- **A read hangs, using no CPU** — h5py holds a global lock while it reads a URL,
+  and the read waits on other threads. If the garbage collector runs on one of them
+  and frees an h5py object, it waits for that lock too, and neither can go on
+  ([h5py's docs](https://docs.h5py.org/en/stable/high/file.html#python-file-like-objects)
+  describe it). sleap-io takes care of this for fsspec's threads from the first time
+  it opens a URL for streaming. That leaves a server in the same process, as in a
+  test using `pytest-httpserver`, and any fsspec file you pass to `h5py.File`
+  yourself before then. Turn the collector off around those (`gc.collect()`, then
+  `gc.disable()`), as sleap-io's own tests do.
 
 !!! note "See also"
     - [`load_slp`][sleap_io.load_slp]: Full URL keyword-argument reference

@@ -659,7 +659,7 @@ def _guard_collection_on_read_threads() -> None:
     waits for fsspec's thread. A collection starts on whichever thread allocates, so it
     can start on that one, and if it frees an h5py object, which can be any h5py object
     the program left in a reference cycle, it wants that lock. Neither can go on, and
-    nothing ever times out.
+    nothing ever times out. h5py's docs warn about it under "Python file-like objects".
 
     A callback can't cancel a collection, but it can leave it nothing to look at, so a
     collection starting on one of those threads freezes everything until it stops. Its
